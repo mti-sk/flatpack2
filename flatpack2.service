@@ -1,0 +1,32 @@
+[Unit]
+Description=Flatpack2 Eltek PSU CAN controller
+Documentation=https://github.com/the6p4c/Flatpack2
+After=network.target
+
+[Service]
+Type=forking
+PIDFile=/var/run/flatpack2.pid
+ExecStart=/usr/bin/python3 /opt/flatpack2/flatpack2.py --daemon
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+# Run as specific user (change as needed)
+# User=flatpack2
+# Group=dialout
+
+# Give access to serial ports
+SupplementaryGroups=dialout
+
+# Working directory (config file is read from here)
+WorkingDirectory=/opt/flatpack2
+
+# Security hardening
+PrivateTmp=true
+ProtectSystem=full
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

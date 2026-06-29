@@ -1,0 +1,8 @@
+# flatpack2 v2.9.3 dependencies
+# Install: pip install -r requirements.txt
+
+# CAN adapter communication (serial port)
+pyserial>=3.5
+
+# Web-GUI dashboard
+flask>=3.0

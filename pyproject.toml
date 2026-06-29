@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "flatpack2"
+version = "2.9.3"
+description = "CLI + Web-GUI controller for Eltek Flatpack2 48V/2000W HE rectifiers via CAN bus"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "mti@mti.sk" }
+]
+keywords = ["flatpack2", "eltek", "can", "psu", "lifepo4", "charger"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: Console",
+    "Topic :: System :: Hardware",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "pyserial>=3.5",
+    "flask>=3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/mti-sk/flatpack2"
+Repository = "https://github.com/mti-sk/flatpack2"
+"Bug Tracker" = "https://github.com/mti-sk/flatpack2/issues"
+
+[project.scripts]
+flatpack2 = "flatpack2:main"
+
+[tool.setuptools]
+py-modules = ["flatpack2"]
+
+[tool.setuptools.package-data]
+"*" = ["flatpack2.conf", "flatpack2_charger.conf", "flatpack2.service"]
