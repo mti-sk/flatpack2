@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# flatpack2 v2.9.3 - 2026
+# flatpack2 v2.9.4 - 2026
 #
 # Copyright (c) 2026 mti@mti.sk
 # Coded by Claude Sonnet 4.6
@@ -8,7 +8,7 @@
 # MIT License - see LICENSE file for details
 # https://github.com/mti-sk/flatpack2
 """
-flatpack2 v2.9.3 - CLI + Web-GUI controller for Eltek Flatpack2 PSU via CAN bus
+flatpack2 v2.9.4 - CLI + Web-GUI controller for Eltek Flatpack2 PSU via CAN bus
 Session state: charger implemented but untested on hardware (first priority next session).
 See README.md for full documentation, API reference and known issues.
 
@@ -69,15 +69,24 @@ import datetime
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-VERSION = "2.9.3"
+VERSION = "2.9.4"
 
 # ---------------------------------------------------------------------------
-# Flatpack2 hardware limits (48V/2000W HE)
+# Flatpack2 hardware limits (48V family)
 # ---------------------------------------------------------------------------
+# Voltage range and OVP ceiling are fixed by the 48V Flatpack2 platform and do
+# NOT depend on the power variant (only the internal power/current modules
+# differ between the 1800W / 2000W / 3000W HE variants).
 PSU_V_MIN = 43.5
 PSU_V_MAX = 57.6
-PSU_I_MAX = 41.7
+PSU_V_NOM = 48.0          # nominal voltage used to derive I_MAX from power_rating
+
+# Power-dependent limits - set from [psu] power_rating at config load time
+# (see load_config()). Defaults below correspond to the 2000W HE variant and
+# are only used until a config is actually loaded.
+PSU_POWER_VARIANTS = (1800.0, 2000.0, 3000.0)
 PSU_P_MAX = 2000.0
+PSU_I_MAX = round(PSU_P_MAX / PSU_V_NOM, 1)   # 41.7 A
 
 # Standby mode: low-power idle (safe voltage, minimum current)
 STANDBY_VOLTAGE = 48.0   # V
@@ -200,6 +209,7 @@ def load_config(path="flatpack2.conf"):
         "psu": {
             "ovp_voltage": "60.0",
             "discovery_timeout": "10",
+            "power_rating": "2000",
         },
     })
 
@@ -209,8 +219,36 @@ def load_config(path="flatpack2.conf"):
     else:
         print("[flatpack2] Config '{}' not found - using defaults".format(path))
 
+    _apply_power_rating(cfg)
     _validate_config(cfg)
     return cfg
+
+def _apply_power_rating(cfg):
+    """
+    Read [psu] power_rating and derive PSU_P_MAX / PSU_I_MAX from it.
+    Must run before _validate_config() and before anything else that checks
+    PSU_I_MAX / PSU_P_MAX (cmd_set, charger limits, HTML limits, help text).
+    Voltage range (PSU_V_MIN/PSU_V_MAX) is NOT affected - it is fixed by the
+    48V Flatpack2 platform regardless of the power variant.
+    """
+    global PSU_P_MAX, PSU_I_MAX
+
+    try:
+        power_rating = cfg.getfloat("psu", "power_rating")
+    except (ValueError, configparser.Error):
+        print("[flatpack2] WARNING: invalid psu.power_rating - using default 2000W")
+        power_rating = 2000.0
+
+    if power_rating not in PSU_POWER_VARIANTS:
+        print("[flatpack2] WARNING: psu.power_rating {:.0f}W is not a known "
+              "Flatpack2 variant {} - using it anyway, but limits may be "
+              "incorrect".format(power_rating, tuple(int(p) for p in PSU_POWER_VARIANTS)))
+
+    PSU_P_MAX = power_rating
+    PSU_I_MAX = round(power_rating / PSU_V_NOM, 1)
+    print("[flatpack2] PSU power rating: {:.0f}W -> I_MAX={:.1f}A "
+          "(V range unchanged: {:.1f}-{:.1f}V)".format(
+              PSU_P_MAX, PSU_I_MAX, PSU_V_MIN, PSU_V_MAX))
 
 def _validate_config(cfg):
     errors = []
@@ -229,7 +267,7 @@ def _validate_config(cfg):
     # OVP voltage
     ovp = cfg.getfloat("psu", "ovp_voltage")
     if ovp < PSU_V_MIN or ovp > 65.0:
-        errors.append("psu.ovp_voltage {:.1f}V out of range (43.5-65.0V)".format(ovp))
+        errors.append("psu.ovp_voltage {:.1f}V out of range ({:.1f}-65.0V)".format(ovp, PSU_V_MIN))
 
     # Discovery timeout
     dt = cfg.getfloat("psu", "discovery_timeout")
@@ -1921,7 +1959,11 @@ class Charger:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-HELP_TEXT = """
+def format_help_text():
+    """Built at call time (not import time) so it reflects the power_rating
+    actually loaded from config (PSU_I_MAX / PSU_P_MAX may differ from the
+    2000W defaults)."""
+    return """
 flatpack2 v{ver} - Eltek Flatpack2 CAN controller
 ===========================================
 Commands:
@@ -1943,7 +1985,7 @@ Charger commands (LiFePO4 CC/CV):
   charge config      Show charger configuration
   charge battery     Show battery parameters (static config)
 
-Limits (Flatpack2 48V/2000W HE):
+Limits (Flatpack2 48V/{pmax:.0f}W HE):
   Voltage : {vmin:.1f} - {vmax:.1f} V
   Current : 0 - {imax:.1f} A
   Power   : max {pmax:.0f} W
@@ -2010,7 +2052,7 @@ def run_cli(bus, terminal=None):
         cmd   = parts[0].lower()
 
         if cmd == "help":
-            out(HELP_TEXT)
+            out(format_help_text())
 
         elif cmd == "shutdown":
             out("[flatpack2] Shutting down...")
@@ -2447,8 +2489,8 @@ input[type=number]:focus{outline:none;border-color:var(--accent);}
   <div class="card">
     <h2>&#9881; PSU Settings</h2>
     <form id="set-form">
-      <div class="form-row"><label>Voltage V</label><input type="number" id="f-voltage" step="0.1" min="43.5" max="57.6" placeholder="54.0"></div>
-      <div class="form-row"><label>Current A</label><input type="number" id="f-current" step="0.1" min="0.1" max="41.7" placeholder="20.0"></div>
+      <div class="form-row"><label>Voltage V</label><input type="number" id="f-voltage" step="0.1" min="__V_MIN__" max="__V_MAX__" placeholder="54.0"></div>
+      <div class="form-row"><label>Current A</label><input type="number" id="f-current" step="0.1" min="0.1" max="__I_MAX__" placeholder="20.0"></div>
       <div class="btn-row">
         <button type="submit" class="btn btn-primary">Set</button>
         <button type="button" class="btn btn-standby" onclick="doStandby()">&#9711; Standby</button>
@@ -2920,6 +2962,9 @@ class WebGUI:
             html = _DASHBOARD_HTML.replace("__VERSION__", VERSION)
             html = html.replace("__STANDBY_V__", "{:.1f}".format(STANDBY_VOLTAGE))
             html = html.replace("__STANDBY_I__", "{:.1f}".format(STANDBY_CURRENT))
+            html = html.replace("__V_MIN__", "{:.1f}".format(PSU_V_MIN))
+            html = html.replace("__V_MAX__", "{:.1f}".format(PSU_V_MAX))
+            html = html.replace("__I_MAX__", "{:.1f}".format(PSU_I_MAX))
             return html
 
         @app.route("/favicon.svg")

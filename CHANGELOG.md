@@ -2,19 +2,39 @@
 
 All notable changes to flatpack2 are documented in this file.
 
-## [2.9.3] - 2026
+## [2.9.4] - 2026
+### Added
+- **`[psu] power_rating`** (1800/2000/3000 W, default 2000) – derives enforced
+  I_MAX/P_MAX limits (`power_rating / 48.0V nominal`) for the actual PSU
+  power variant; voltage range/OVP are unaffected (fixed by the 48V platform)
+- **`DISCLAIMER.md`** – legal disclaimer (experimental/reverse-engineered
+  software, no warranty, no liability); summary added to top of `README.md`
+
 ### Fixed
-- **Bug: Ah/Wh integration nefungovala** – chybějící `now = time.time()` v `on_status` způsoboval `NameError` a nulové hodnoty Ah/Wh v CC/CV fázi
-- **Bug: detekce baterie pouze napěťová** – přidána OR podmínka: `vout > detect_v + threshold OR iout >= min_current_detect`; pokryje vybitou baterii pod `detect_voltage`
+- **README/CHANGELOG inconsistency**: several places still documented the
+  old standby values (53.5V) after they were changed to 48.0V in v2.9.3
+- CLI help text and Web-GUI voltage/current input limits are now generated
+  from the loaded config instead of hardcoded 2000W-variant defaults
 
 ### Changed
-- **Standby hodnoty: 53.5V → 48.0V** (proud 0.1A beze změny)
-- **`charge stop` / DONE / ERROR** – PSU se vždy nastaví na standby hodnoty (48.0V / 0.1A)
-- **RAMP start** – napětí začíná od `max(vout - 3 × ramp_step_voltage, detect_voltage)` místo přesně od `vout`; zaručí že první SET je pod napětím baterie
-- **Web GUI Charger karta** – přidány hodnoty Actual V a Actual I (živé ze SSE)
-- **Web GUI Charger progress bar** – zobrazuje postup i v RAMP fázi (`ramp_v / target_v × 100`)
-- **Web GUI fáze mapa** – opraveny/přidány fáze `detect`, `ramp`; odstraněna stará `waiting`
-- **SSE payload** – přidáno pole `ramp_v` do charger dat
+- Last changelog entry (v2.9.3) translated from Czech to English
+- Version bump 2.9.3 → 2.9.4
+
+---
+
+
+### Fixed
+- **Bug: Ah/Wh integration not working** – missing `now = time.time()` in `on_status` caused a `NameError` and zero Ah/Wh values during CC/CV phase
+- **Bug: battery detection was voltage-only** – added an OR condition: `vout > detect_v + threshold OR iout >= min_current_detect`; now also covers a battery discharged below `detect_voltage`
+
+### Changed
+- **Standby values: 53.5V → 48.0V** (current 0.1A unchanged)
+- **`charge stop` / DONE / ERROR** – PSU is always set to standby values (48.0V / 0.1A)
+- **RAMP start** – voltage now starts from `max(vout - 3 × ramp_step_voltage, detect_voltage)` instead of exactly from `vout`; guarantees the first SET is below battery voltage
+- **Web GUI Charger card** – added Actual V and Actual I values (live from SSE)
+- **Web GUI Charger progress bar** – now shows progress during RAMP phase too (`ramp_v / target_v × 100`)
+- **Web GUI phase map** – fixed/added `detect`, `ramp` phases; removed the old `waiting` phase
+- **SSE payload** – added `ramp_v` field to charger data
 - Version bump 2.9.2 → 2.9.3
 
 ---

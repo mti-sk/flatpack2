@@ -6,6 +6,19 @@
 
 ---
 
+## ⚠️ Disclaimer
+
+This project is tested and works on real hardware, but it is **experimental
+software based on reverse engineering** of an undocumented CAN protocol.
+It is provided **as-is, with no warranty, and no liability for any damage**
+resulting from its use – including damage to your PSU, battery, or other
+connected equipment. Not affiliated with Eltek. You use this software
+entirely at your own risk.
+
+Full text: [`DISCLAIMER.md`](DISCLAIMER.md)
+
+---
+
 ## Features
 
 - **CAN communication** via Waveshare USB-CAN-A (native binary protocol, not slcan)
@@ -14,7 +27,7 @@
 - **Web-GUI dashboard** – mobile-first dark theme, live SSE updates every 10 s
   - PSU status (Vout, Iout, Vin, temperatures, mode)
   - Set voltage / current with confirmation dialog
-  - **Standby button** – sets PSU to 53.5 V / 0.1 A safe idle state
+  - **Standby button** – sets PSU to 48.0 V / 0.1 A safe idle state
   - LiFePO4 charger control (start / stop / progress bar)
   - **Battery parameters card** – static config overview (cells, voltages, currents, limits)
   - Live graphs: Vout+Iout, Delivered capacity [Ah], Delivered energy [Wh] – time window 15 min / 1 h / 12 h
@@ -28,12 +41,13 @@
   - CV phase: voltage held, current tapers until `charge_current_tail`
   - Battery disconnect during RAMP returns to DETECT automatically
   - **Auto-start** on program startup and after CAN reconnect (configurable)
-- **Standby mode** – sets PSU to 53.5 V / 0.1 A; overwrites restore values so reconnect keeps standby
+- **Standby mode** – sets PSU to 48.0 V / 0.1 A; overwrites restore values so reconnect keeps standby
 - **Value restore on reconnect** – last set voltage/current automatically re-applied after CAN bus recovery
 - **Charge resume on reconnect** – if charging was active before CAN loss, it resumes automatically
 - **Daemonization** – double-fork, PID file, systemd service included
 - **CAN watchdog** – auto-reconnect on communication loss
 - **Per-PSU startup config** – serial number mapping, auto-apply on discovery
+- **Configurable power rating** – `power_rating` (1800/2000/3000 W) derives enforced current/power limits for your specific PSU variant
 - **Log rotation** – `RotatingFileHandler`
 - **SIGHUP** reloads log level from the config file specified at startup (`--config`)
 
@@ -220,6 +234,8 @@ autodetect       = true           # find adapter by USB VID:PID
 [psu]
 ovp_voltage      = 60.0           # over-voltage protection (V)
 discovery_timeout = 10            # seconds to wait for PSU on startup
+power_rating     = 2000           # PSU power variant (W): 1800 / 2000 / 3000
+                                   # derives enforced I_MAX = power_rating / 48.0V
 
 [webgui]
 enabled          = true
@@ -342,7 +358,7 @@ help                    Show help
 get                     Show status of all PSUs
 get <id>                Show status of PSU with given ID
 set <id|all> <V> <I>    Set voltage (V) and current (A)
-standby                 Set ALL PSUs to standby (53.5 V / 0.1 A)
+standby                 Set ALL PSUs to standby (48.0 V / 0.1 A)
 standby <id>            Set PSU <id> to standby
 map                     Show serial → ID mapping
 
@@ -384,7 +400,7 @@ All endpoints return JSON unless noted.
 | GET | `/events` | SSE stream (10 s interval) |
 | GET | `/api/status` | Single status snapshot (JSON) |
 | POST | `/api/set` | Set voltage/current |
-| POST | `/api/standby` | Set PSU to standby (53.5 V / 0.1 A) |
+| POST | `/api/standby` | Set PSU to standby (48.0 V / 0.1 A) |
 | POST | `/api/charge/start` | Start charging |
 | POST | `/api/charge/stop` | Stop charging |
 | GET | `/api/history` | Download history as CSV |
@@ -412,15 +428,25 @@ Returns CSV: `timestamp_ms,vout,iout,ah,wh`
 
 ---
 
-## PSU Limits (Flatpack2 48V/2000W HE)
+## PSU Limits (Flatpack2 48V family)
 
-| Parameter | Min | Max |
-|-----------|-----|-----|
-| Voltage | 43.5 V | 57.6 V |
-| Current | 0.1 A | 41.7 A |
-| Power | — | 2000 W |
+The Eltek Flatpack2 48V rectifier is produced in several power variants.
+The voltage range and CAN protocol are identical across variants; only the
+max current/power differs. Set `power_rating` in `[psu]` to match your
+hardware – this drives the software-enforced current/power limits.
 
-Current is automatically limited if `V × I > 2000 W`.
+| `power_rating` | Voltage | Current (I_MAX) | Power |
+|----------------|---------|------------------|-------|
+| 1800 W         | 43.5 – 57.6 V | ~37.5 A | 1800 W |
+| **2000 W** (default) | 43.5 – 57.6 V | ~41.7 A | 2000 W |
+| 3000 W         | 43.5 – 57.6 V | ~62.5 A | 3000 W |
+
+`I_MAX` is derived as `power_rating / 48.0 V` (nominal). Current is
+automatically limited if `V × I` would exceed the configured power.
+
+**Note:** setting `power_rating` only changes the software limit check – it
+does not change what your physical unit is actually rated for. Make sure
+the value matches the label on your PSU; see [`DISCLAIMER.md`](DISCLAIMER.md).
 
 ---
 
@@ -442,13 +468,14 @@ flatpack2_charger.conf   Configuration – PSU controller + LiFePO4 charger
 flatpack2.service        systemd service unit
 requirements.txt         Python dependencies
 README.md                This file
+DISCLAIMER.md            Legal disclaimer (no warranty, no liability, experimental software)
 ```
 
 ---
 
 ## Session state summary (for continuation)
 
-**Version:** 2.9.3
+**Version:** 2.9.4
 
 **Hardware confirmed working:**
 - CAN frame format (AA / E0|len / ID LE / data / 55)
@@ -463,12 +490,19 @@ README.md                This file
 - Multi-PSU STATUS dispatch maps all STATUS to PSU_1 – cannot fix without hardware testing; `yy` byte role needs verification
 - DETECT→RAMP→CC charger flow untested on real hardware
 - Assumption: `vout` in STATUS frame reflects actual output terminal voltage even when PSU is passive (battery backfeed). Needs hardware verification.
+- `power_rating` variants (1800W/3000W) are only validated logically (limit math); only the 2000W variant has been confirmed on real hardware so far
+
+**v2.9.4 changes:**
+- Added `[psu] power_rating` config option (1800/2000/3000W, default 2000W) – derives I_MAX/P_MAX
+- Added `DISCLAIMER.md`, referenced from top of README
+- Fixed stale 53.5V standby mentions left over in README after the v2.9.3 change to 48.0V
+- Translated v2.9.3 changelog entry to English
 
 **v2.9.3 changes:**
-- Bug fix: Ah/Wh nefungovalo – chybějící `now = time.time()` v `on_status`
-- Bug fix: detekce baterie – přidána OR podmínka (napěťová + proudová)
-- Standby hodnoty: 53.5V → 48.0V
-- `charge stop` / DONE / ERROR → PSU na 48.0V / 0.1A
-- RAMP start od `vout - 3 × ramp_step_voltage` (ne přesně od vout)
-- Web GUI Charger: Actual V, Actual I, RAMP progress bar, opraveny fáze
-- Alert request bug při CC statusu – noted, fix deferred
+- Bug fix: Ah/Wh not working – missing `now = time.time()` in `on_status`
+- Bug fix: battery detection – added OR condition (voltage-based + current-based)
+- Standby values: 53.5V → 48.0V
+- `charge stop` / DONE / ERROR → PSU set to 48.0V / 0.1A
+- RAMP starts from `vout - 3 × ramp_step_voltage` (not exactly from vout)
+- Web GUI Charger: Actual V, Actual I, RAMP progress bar, fixed phases
+- Alert request bug during CC status – noted, fix deferred
