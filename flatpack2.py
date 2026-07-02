@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# flatpack2 v2.9.4 - 2026
+# flatpack2 v2.9.5 - 2026
 #
 # Copyright (c) 2026 mti@mti.sk
 # Coded by Claude Sonnet 4.6
@@ -8,8 +8,7 @@
 # MIT License - see LICENSE file for details
 # https://github.com/mti-sk/flatpack2
 """
-flatpack2 v2.9.4 - CLI + Web-GUI controller for Eltek Flatpack2 PSU via CAN bus
-Session state: charger implemented but untested on hardware (first priority next session).
+flatpack2 v2.9.5 - CLI + Web-GUI controller for Eltek Flatpack2 PSU via CAN bus
 See README.md for full documentation, API reference and known issues.
 
 Supports Waveshare USB-CAN-A adapter (STM32, CH341, native binary protocol).
@@ -69,7 +68,7 @@ import datetime
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-VERSION = "2.9.4"
+VERSION = "2.9.5"
 
 # ---------------------------------------------------------------------------
 # Flatpack2 hardware limits (48V family)
@@ -604,6 +603,7 @@ class FlatpackBus:
         self._port       = None
 
         self._tx_lock    = threading.Lock()
+        self._reconnect_lock = threading.Lock()   # guards against concurrent _reconnect()
         self.psus        = {}     # serial_hex -> PSUState
         self._id_map     = {}     # psu_id -> serial_hex
         self._serial_map = {}     # serial_hex -> psu_id (reverse)
@@ -625,8 +625,7 @@ class FlatpackBus:
             print(msg)
         # Direct write to web log buffer without dependency on logging handler
         if self.webgui is not None:
-            import datetime as _dt
-            ts = _dt.datetime.now().strftime("%H:%M:%S")
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
             self.webgui.add_log_line("{} {}".format(ts, msg.strip()))
 
     # ------------------------------------------------------------------
@@ -654,6 +653,18 @@ class FlatpackBus:
         self._connected = False
 
     def _reconnect(self):
+        # Guard: reconnect can be triggered concurrently by the rx thread
+        # (SerialException) and by the watchdog. Only one may run at a time;
+        # the loser returns immediately.
+        if not self._reconnect_lock.acquire(blocking=False):
+            log.debug("Reconnect already in progress - skipping duplicate trigger")
+            return
+        try:
+            self._do_reconnect()
+        finally:
+            self._reconnect_lock.release()
+
+    def _do_reconnect(self):
         log.warning("CAN bus error - attempting reconnect...")
         self._connected = False
 
@@ -1563,8 +1574,6 @@ class Charger:
         self._print   = print_fn
         self.state    = ChargerState()
         self._lock    = threading.Lock()
-        self._monitor_thread = None
-        self._running = False
 
     # ------------------------------------------------------------------
     # Integration - called from FlatpackBus._handle_status
@@ -1881,7 +1890,7 @@ class Charger:
 
     def _finish(self, reason, error=False):
         """Called from on_status (already locked)."""
-        self._do_stop(reason)
+        self._do_stop(reason, error=error)
         if error:
             self._print("[charger] ERROR: {}".format(reason), async_msg=True)
             log.error("Charge stopped: {}".format(reason))
@@ -1891,9 +1900,11 @@ class Charger:
         self._print("[charger] Total: {:.2f}Ah  {:.2f}Wh  Time: {}".format(
             self.state.ah, self.state.wh, self.state.elapsed_str), async_msg=True)
 
-    def _do_stop(self, reason):
-        """Set PSU to standby values and update state. Must be called with lock held."""
-        self.state.phase       = ChargePhase.DONE
+    def _do_stop(self, reason, error=False):
+        """Set PSU to standby values and update state. Must be called with lock held.
+        error=True marks the stop as an error condition (phase=ERROR instead of DONE);
+        the PSU action is identical in both cases (standby values)."""
+        self.state.phase       = ChargePhase.ERROR if error else ChargePhase.DONE
         self.state.stop_reason = reason
         self.bus.cmd_set(STANDBY_VOLTAGE, STANDBY_CURRENT)
 
@@ -1941,20 +1952,6 @@ class Charger:
         if s.stop_reason:
             lines.append("Stop reason: {}".format(s.stop_reason))
         return lines
-
-    def start_monitor(self, out_fn, interval=None, stop_event=None):
-        """Start continuous monitor output. Runs in calling thread until stop_event."""
-        interval = interval or self.cfg["monitor_interval"]
-        self._print("[charger] Monitor started (Enter to stop)".format(), async_msg=False)
-        while True:
-            if stop_event and stop_event.is_set():
-                break
-            lines = self.get_status_lines()
-            out_fn("\n--- Charge status {} ---".format(
-                time.strftime("%H:%M:%S")))
-            for l in lines:
-                out_fn("  " + l)
-            time.sleep(interval)
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -2369,7 +2366,7 @@ _FAVICON_SVG = (
 
 _DASHBOARD_HTML = """\
 <!DOCTYPE html>
-<html lang="cs">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -3025,8 +3022,10 @@ class WebGUI:
             data    = request.get_json(force=True) or {}
             current = data.get("current")
             if current is not None:
-                try:    current = float(current)
-                except: current = None
+                try:
+                    current = float(current)
+                except (ValueError, TypeError):
+                    current = None
             psu_ids = list(self.bus._id_map.keys())
             if not psu_ids:
                 return jsonify({"ok": False, "message": "No PSU found"}), 400
@@ -3190,6 +3189,71 @@ def _handle_sighup(signo, frame):
     cfg = load_config(_config_path)
     level = getattr(logging, cfg.get("logging", "loglevel").upper(), logging.INFO)
     log.setLevel(level)
+    # Handlers keep their own level from setup_logging() - update them too,
+    # otherwise raising verbosity (e.g. INFO -> DEBUG) would have no effect.
+    for h in log.handlers:
+        h.setLevel(level)
+
+# ---------------------------------------------------------------------------
+# Bundled data files (config templates, systemd unit, install scripts)
+# ---------------------------------------------------------------------------
+def find_data_dir():
+    """
+    Locate the directory with bundled data files (flatpack2.conf,
+    flatpack2_charger.conf, flatpack2.service, install/uninstall scripts).
+
+    Search order covers all supported installation methods:
+      1. <sys.prefix>/share/flatpack2   - pipx / venv / system pip
+         (wheel data-files, see pyproject.toml)
+      2. <user base>/share/flatpack2    - 'pip install --user'
+      3. directory of flatpack2.py      - git checkout / install.sh layout
+    Returns absolute path or None.
+    """
+    candidates = [os.path.join(sys.prefix, "share", "flatpack2")]
+    try:
+        import site
+        candidates.append(os.path.join(site.USER_BASE, "share", "flatpack2"))
+    except Exception:
+        pass
+    candidates.append(os.path.dirname(os.path.abspath(__file__)))
+
+    for d in candidates:
+        if os.path.isfile(os.path.join(d, "flatpack2.conf")):
+            return d
+    return None
+
+def print_data_files():
+    """Implementation of 'flatpack2 --files': show bundled files and copy hints."""
+    d = find_data_dir()
+    if d is None:
+        print("flatpack2: bundled data files not found.")
+        print("Expected in <prefix>/share/flatpack2/ or next to flatpack2.py.")
+        return 1
+
+    names = ("flatpack2.conf", "flatpack2_charger.conf", "flatpack2.service",
+             "install.sh", "uninstall.sh")
+    print("Bundled files directory:")
+    print("  {}".format(d))
+    print("")
+    print("Files:")
+    for n in names:
+        p = os.path.join(d, n)
+        if os.path.isfile(p):
+            print("  {}".format(p))
+    print("")
+    print("Typical next steps (as root):")
+    print("  mkdir -p /etc/flatpack2")
+    print("  cp {}/flatpack2.conf /etc/flatpack2/".format(d))
+    print("  #   or flatpack2_charger.conf for the LiFePO4 charger setup")
+    print("  cp {}/flatpack2.service /etc/systemd/system/".format(d))
+    print("  #   then edit ExecStart= to point to this binary, e.g.:")
+    print("  #   ExecStart={} --config /etc/flatpack2/flatpack2.conf".format(
+        os.path.realpath(sys.argv[0]) if sys.argv else "flatpack2"))
+    print("  systemctl daemon-reload && systemctl enable --now flatpack2")
+    print("")
+    print("Run manually:")
+    print("  flatpack2 --config /etc/flatpack2/flatpack2.conf")
+    return 0
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -3200,8 +3264,13 @@ def main():
     parser = argparse.ArgumentParser(description="flatpack2 v{} - Eltek Flatpack2 CAN controller".format(VERSION))
     parser.add_argument("--daemon",  action="store_true", help="Run as background daemon")
     parser.add_argument("--config",  default="flatpack2.conf", help="Config file path")
+    parser.add_argument("--files",   action="store_true",
+                        help="Show bundled config/service files and copy instructions, then exit")
     parser.add_argument("--version", action="version", version="flatpack2 v{}".format(VERSION))
     args = parser.parse_args()
+
+    if args.files:
+        sys.exit(print_data_files())
 
     _config_path = args.config
 

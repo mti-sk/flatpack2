@@ -2,6 +2,52 @@
 
 All notable changes to flatpack2 are documented in this file.
 
+## [2.9.5] - 2026
+### Added
+- **Bundled data files in the wheel**: `flatpack2.conf`, `flatpack2_charger.conf`,
+  `flatpack2.service`, `install.sh` and `uninstall.sh` are now shipped inside
+  the pip/pipx package (installed to `<venv>/share/flatpack2/`)
+- **`flatpack2 --files`**: prints the location of the bundled files and
+  ready-to-paste commands for copying the config to `/etc/flatpack2/` and the
+  systemd unit to `/etc/systemd/system/` (with the correct `ExecStart=` path);
+  works for pipx/venv installs, `pip install --user` and git checkouts
+
+### Fixed
+- **`pyproject.toml`: invalid build backend** `setuptools.backends.legacy:build`
+  (module does not exist) replaced with `setuptools.build_meta`; this fixes
+  `pipx install git+...` (Option A in README), which previously failed to build
+- **Charger ERROR phase was never reported**: `_do_stop()` always set phase to
+  `done`, so safety timeout / PSU ALARM / High Temp stops showed as `done`
+  instead of `error` in CLI and Web GUI. PSU behaviour (standby on stop) is
+  unchanged; only the reported phase is corrected
+- **SIGHUP log-level reload now also updates handler levels** - previously
+  raising verbosity (e.g. INFO -> DEBUG) at runtime had no effect because the
+  file/console handlers kept their original level
+- **Concurrent CAN reconnect race**: `_reconnect()` could be triggered
+  simultaneously by the rx thread (SerialException) and the watchdog; a
+  non-blocking guard lock now ensures only one reconnect loop runs at a time
+- **Shipped `flatpack2.service` was broken for manual installs**: used system
+  `python3` (flask typically missing), `Type=forking` + `--daemon`, a foreign
+  `Documentation=` URL, and `PrivateTmp=true` which hid `/tmp/flatpack2.pty`
+  in a private namespace so `screen` could not attach. The unit now matches
+  the layout produced by `install.sh` (venv python, `Type=simple`, journal
+  output, PrivateTmp disabled with an explanatory comment)
+
+### Changed
+- Removed stale AI-session notes: module docstring line ("charger ...
+  untested on hardware") and the README "Session state summary" section,
+  replaced by a proper **Known limitations** chapter (documents the
+  single-PSU STATUS dispatch limitation, `vout` backfeed assumption,
+  power-variant validation status, and Web-GUI security notes)
+- Removed dead code: `Charger.start_monitor()`, `Charger._monitor_thread`,
+  `Charger._running` (CLI `charge monitor` has its own implementation)
+- Minor cleanups: module-level `datetime` reused in `FlatpackBus._print()`
+  (no per-call import), dashboard `<html lang>` fixed to `en`, bare
+  `except:` in `/api/charge/start` narrowed to `(ValueError, TypeError)`
+- Version bump 2.9.4 -> 2.9.5
+
+---
+
 ## [2.9.4] - 2026
 ### Added
 - **`[psu] power_rating`** (1800/2000/3000 W, default 2000) – derives enforced

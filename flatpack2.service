@@ -1,17 +1,20 @@
 [Unit]
-Description=Flatpack2 Eltek PSU CAN controller
-Documentation=https://github.com/the6p4c/Flatpack2
+Description=flatpack2 - Eltek Flatpack2 CAN controller
+Documentation=https://github.com/mti-sk/flatpack2
 After=network.target
 
 [Service]
-Type=forking
-PIDFile=/var/run/flatpack2.pid
-ExecStart=/usr/bin/python3 /opt/flatpack2/flatpack2.py --daemon
+# Matches the layout created by install.sh (/opt/flatpack2 + venv,
+# config in /etc/flatpack2). Adjust paths for a custom installation.
+Type=simple
+ExecStart=/opt/flatpack2/venv/bin/python /opt/flatpack2/flatpack2.py --config /etc/flatpack2/flatpack2.conf
 ExecReload=/bin/kill -HUP $MAINPID
-ExecStop=/bin/kill -TERM $MAINPID
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=flatpack2
 
 # Run as specific user (change as needed)
 # User=flatpack2
@@ -20,11 +23,13 @@ TimeoutStopSec=10
 # Give access to serial ports
 SupplementaryGroups=dialout
 
-# Working directory (config file is read from here)
+# Working directory (relative log file path resolves here)
 WorkingDirectory=/opt/flatpack2
 
 # Security hardening
-PrivateTmp=true
+# NOTE: PrivateTmp must stay disabled - the PTY symlink /tmp/flatpack2.pty
+# would otherwise be created in a private namespace and 'screen' could not
+# attach to it from a user session.
 ProtectSystem=full
 NoNewPrivileges=true
 

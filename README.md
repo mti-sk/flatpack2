@@ -114,6 +114,20 @@ pipx install git+https://github.com/mti-sk/flatpack2.git
 flatpack2 --config /etc/flatpack2/flatpack2.conf
 ```
 
+The wheel bundles the config templates, systemd unit and install scripts.
+After installation run:
+
+```bash
+flatpack2 --files
+```
+
+This prints the directory with the bundled files (typically
+`~/.local/share/pipx/venvs/flatpack2/share/flatpack2/`) together with
+ready-to-paste commands for copying the config to `/etc/flatpack2/` and the
+service unit to `/etc/systemd/system/` (including the correct `ExecStart=`
+path for your pipx binary). You decide what to copy where - nothing is
+written outside the pipx venv automatically.
+
 To upgrade to the latest version:
 
 ```bash
@@ -473,36 +487,30 @@ DISCLAIMER.md            Legal disclaimer (no warranty, no liability, experiment
 
 ---
 
-## Session state summary (for continuation)
+## Known limitations
 
-**Version:** 2.9.4
+- **Single PSU only.** The internal ID/serial mapping infrastructure is
+  prepared for multiple rectifiers, but `_handle_status()` currently
+  attributes **all** STATUS frames to PSU 1 and login uses a fixed
+  arbitration ID for every unit. With more than one Flatpack2 on the bus,
+  readings from different units would be mixed into a single record.
+  Proper multi-PSU support requires per-unit login IDs and STATUS
+  dispatching, which cannot be implemented safely without hardware
+  testing with multiple rectifiers.
+- Assumption: `vout` in the STATUS frame reflects the actual output
+  terminal voltage even when the PSU is passive (battery backfeed).
+  This matches observed behaviour but has not been exhaustively verified.
+- `power_rating` variants 1800 W / 3000 W are validated logically
+  (limit math only); only the 2000 W variant has been confirmed on real
+  hardware so far.
+- The Web-GUI has **no authentication** and uses the Flask development
+  server. Keep it on a trusted LAN (`host = 0.0.0.0`) or bind to
+  `127.0.0.1` and use an SSH tunnel / reverse proxy if exposure is a
+  concern.
 
-**Hardware confirmed working:**
-- CAN frame format (AA / E0|len / ID LE / data / 55)
-- LOGIN arb `0x05004804`, interval 1 s
-- SET arb `0x05FF4004` (broadcast only)
-- STATUS mask `0xFFFFFF00 == 0x05014000`
-- Serial number format: hex bytes reported as hex string
-- Startup apply via broadcast SET works correctly on real hardware
-- Value restore after CAN reconnect confirmed working
+**Hardware confirmed working** (real Flatpack2 48V/2000W HE + Waveshare
+USB-CAN-A): CAN frame format, LOGIN keepalive, broadcast SET, STATUS
+parsing, serial-number mapping, startup apply, value restore after CAN
+reconnect, and the full DETECT → RAMP → CC → CV charger flow.
 
-**Known issues:**
-- Multi-PSU STATUS dispatch maps all STATUS to PSU_1 – cannot fix without hardware testing; `yy` byte role needs verification
-- DETECT→RAMP→CC charger flow untested on real hardware
-- Assumption: `vout` in STATUS frame reflects actual output terminal voltage even when PSU is passive (battery backfeed). Needs hardware verification.
-- `power_rating` variants (1800W/3000W) are only validated logically (limit math); only the 2000W variant has been confirmed on real hardware so far
-
-**v2.9.4 changes:**
-- Added `[psu] power_rating` config option (1800/2000/3000W, default 2000W) – derives I_MAX/P_MAX
-- Added `DISCLAIMER.md`, referenced from top of README
-- Fixed stale 53.5V standby mentions left over in README after the v2.9.3 change to 48.0V
-- Translated v2.9.3 changelog entry to English
-
-**v2.9.3 changes:**
-- Bug fix: Ah/Wh not working – missing `now = time.time()` in `on_status`
-- Bug fix: battery detection – added OR condition (voltage-based + current-based)
-- Standby values: 53.5V → 48.0V
-- `charge stop` / DONE / ERROR → PSU set to 48.0V / 0.1A
-- RAMP starts from `vout - 3 × ramp_step_voltage` (not exactly from vout)
-- Web GUI Charger: Actual V, Actual I, RAMP progress bar, fixed phases
-- Alert request bug during CC status – noted, fix deferred
+For per-version changes see [`CHANGELOG.md`](CHANGELOG.md).

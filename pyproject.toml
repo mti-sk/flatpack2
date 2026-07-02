@@ -1,10 +1,10 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "flatpack2"
-version = "2.9.4"
+version = "2.9.5"
 description = "CLI + Web-GUI controller for Eltek Flatpack2 48V/2000W HE rectifiers via CAN bus"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -36,5 +36,14 @@ flatpack2 = "flatpack2:main"
 [tool.setuptools]
 py-modules = ["flatpack2"]
 
-[tool.setuptools.package-data]
-"*" = ["flatpack2.conf", "flatpack2_charger.conf", "flatpack2.service"]
+# Ship config templates, systemd unit and install scripts inside the wheel.
+# After 'pipx install' they land in <venv>/share/flatpack2/ ; run
+# 'flatpack2 --files' to locate them and get copy instructions.
+[tool.setuptools.data-files]
+"share/flatpack2" = [
+    "flatpack2.conf",
+    "flatpack2_charger.conf",
+    "flatpack2.service",
+    "install.sh",
+    "uninstall.sh",
+]
