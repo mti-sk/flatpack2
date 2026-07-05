@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flatpack2"
-version = "3.0.2"
+version = "3.1.0"
 description = "CLI + Web-GUI controller for Eltek Flatpack2 48V/2000W HE rectifiers via CAN bus"
 readme = "README.md"
 license = { file = "LICENSE" }

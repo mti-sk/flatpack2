@@ -2,6 +2,41 @@
 
 All notable changes to flatpack2 are documented in this file.
 
+## [3.1.0] - 2026
+
+### Added
+- **Offline Web-GUI**: Chart.js and the date-fns adapter are no longer
+  loaded from the CDN at page load. The dashboard references
+  `/static/chart.umd.min.js` and `/static/chartjs-adapter-date-fns.bundle.min.js`,
+  served by a new whitelisted Flask route from a local `static/` directory
+  (searched next to `flatpack2.py`, then in the data dir).
+- **Automatic asset download**: missing JS assets are fetched automatically
+  in a background thread on every Web-GUI start (`ensure_webgui_assets`),
+  and by `install.sh` at install time. Downloads are atomic (`.part` +
+  rename) with a size sanity check. Failure is non-fatal: while the files
+  are absent, `/static/` responds with a 302 redirect to the pinned CDN URL,
+  so an online dashboard keeps working; a `notify()` warning is raised and
+  the download is retried on the next start.
+
+### Fixed
+- **Startup without CAN adapter**: a missing adapter no longer terminates
+  the program (`FATAL` + exit 1). flatpack2 now waits and retries the
+  connection every `can.connect_retry_interval` seconds (default 10, new
+  config key) until the adapter appears.
+- **Startup with PSU offline / headless operation**: when running without a
+  usable interactive stdin (systemd service, background, `stdio` terminal
+  type), `input()` received an immediate EOF and the CLI loop exited,
+  taking the whole program down right after "Auto-start: no PSUs found".
+  The CLI now detects EOF on a non-TTY stdin and stays alive headless
+  (stop via SIGTERM); interactive Ctrl+D still exits normally.
+
+### Changed
+- **Deferred charging auto-start**: with `auto_start` enabled and no PSU
+  present at startup, charging is no longer skipped permanently. A one-shot
+  background waiter starts charging automatically as soon as the first PSU
+  logs in and stabilizes (~3 s). It never re-triggers after a manual stop
+  and yields if charging was already started manually.
+
 ## [3.0.2] - 2026
 ### Fixed
 - **PSU overload at the RAMP->CC transition** (diagnosed from a real

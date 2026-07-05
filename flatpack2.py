@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# flatpack2 v3.0.2 - 2026
+# flatpack2 v3.1.0 - 2026
 #
 # Copyright (c) 2026 mti@mti.sk
 # Coded by Claude Sonnet 4.6
@@ -8,7 +8,7 @@
 # MIT License - see LICENSE file for details
 # https://github.com/mti-sk/flatpack2
 """
-flatpack2 v3.0.2 - CLI + Web-GUI controller for Eltek Flatpack2 PSU via CAN bus
+flatpack2 v3.1.0 - CLI + Web-GUI controller for Eltek Flatpack2 PSU via CAN bus
 See README.md for full documentation, API reference and known issues.
 
 Supports Waveshare USB-CAN-A adapter (STM32, CH341, native binary protocol).
@@ -68,7 +68,19 @@ import datetime
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-VERSION = "3.0.2"
+VERSION = "3.1.0"
+
+# ---------------------------------------------------------------------------
+# Web-GUI vendored JS assets (Chart.js) - served locally for offline use.
+# Missing files are auto-downloaded on Web-GUI start (when online) and by
+# install.sh; while absent, /static/ redirects to the pinned CDN URL.
+# ---------------------------------------------------------------------------
+WEBGUI_ASSETS = (
+    ("chart.umd.min.js",
+     "https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"),
+    ("chartjs-adapter-date-fns.bundle.min.js",
+     "https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"),
+)
 
 # ---------------------------------------------------------------------------
 # Flatpack2 hardware limits (48V family)
@@ -178,6 +190,7 @@ def load_config(path="flatpack2.conf"):
             "bitrate": "125000",
             "serial_baudrate": "2000000",
             "autodetect": "true",
+            "connect_retry_interval": "10",
         },
         "logging": {
             "logfile": "flatpack2.log",
@@ -2443,6 +2456,18 @@ def run_cli(bus, terminal=None):
     while True:
         raw = inp("fp2> ")
         if raw is None:
+            if terminal is None and not sys.stdin.isatty():
+                # Running as a service / in background: stdin is /dev/null
+                # and input() returns EOF immediately. Do NOT exit the
+                # program - keep all worker threads alive headless.
+                out("[flatpack2] No interactive stdin - running headless "
+                    "(send SIGTERM to stop).")
+                log.info("CLI headless mode (no usable stdin)")
+                try:
+                    while True:
+                        time.sleep(3600)
+                except KeyboardInterrupt:
+                    pass
             out("[flatpack2] Session closed.")
             break
         raw = raw.strip()
@@ -2898,8 +2923,8 @@ _DASHBOARD_HTML = """\
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Flatpack2 Dashboard</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<script src="/static/chart.umd.min.js"></script>
+<script src="/static/chartjs-adapter-date-fns.bundle.min.js"></script>
 <style>
 :root {
   --bg:#0f0f1a; --surface:#1a1a2e; --surface2:#16213e;
@@ -3478,6 +3503,87 @@ function showResult(id, msg, ok) {
 """
 
 
+def webgui_asset_dirs():
+    """Directories searched for vendored Web-GUI JS assets (offline mode)."""
+    dirs = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")]
+    d = find_data_dir()
+    if d:
+        p = os.path.join(d, "static")
+        if p not in dirs:
+            dirs.append(p)
+    return dirs
+
+def find_webgui_asset(fname):
+    """Return local path of a vendored asset, or None if not present."""
+    for d in webgui_asset_dirs():
+        p = os.path.join(d, fname)
+        if os.path.isfile(p):
+            return p
+    return None
+
+def ensure_webgui_assets(notify_fn=None):
+    """
+    Download missing Web-GUI JS assets (Chart.js) so the dashboard graph
+    works fully offline. Runs in a background thread on Web-GUI start.
+    Files go to the first writable directory from webgui_asset_dirs().
+    Failure is non-fatal: while online the dashboard falls back to a CDN
+    redirect; the download is retried on every program start.
+    """
+    import urllib.request
+    missing = [(f, u) for f, u in WEBGUI_ASSETS if find_webgui_asset(f) is None]
+    if not missing:
+        return True
+
+    target = None
+    for d in webgui_asset_dirs():
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, ".write_test")
+            with open(probe, "w"):
+                pass
+            os.remove(probe)
+            target = d
+            break
+        except OSError:
+            continue
+    if target is None:
+        log.warning("Web-GUI assets: no writable static/ directory found")
+        return False
+
+    ok = True
+    for fname, url in missing:
+        tmp = os.path.join(target, fname + ".part")
+        try:
+            with urllib.request.urlopen(url, timeout=15) as r:
+                data = r.read()
+            if len(data) < 10240:
+                raise OSError("suspiciously small download "
+                              "({} bytes)".format(len(data)))
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, os.path.join(target, fname))
+            log.info("Web-GUI asset downloaded: {} ({} kB)".format(
+                fname, len(data) // 1024))
+        except Exception as e:
+            ok = False
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            log.warning("Web-GUI asset download failed ({}): {}".format(
+                fname, e))
+
+    if ok:
+        log.info("Web-GUI assets ready - dashboard graph works offline")
+    else:
+        msg = ("Web-GUI: Chart.js assets missing - graph needs internet "
+               "(CDN fallback); will retry download on next start")
+        if notify_fn:
+            notify_fn(msg, "warning")
+        else:
+            log.warning(msg)
+    return ok
+
 class WebGUI:
     """
     Flask-based web dashboard for flatpack2.
@@ -3542,6 +3648,24 @@ class WebGUI:
         @app.route("/favicon.svg")
         def favicon():
             return Response(_FAVICON_SVG, mimetype="image/svg+xml")
+
+        @app.route("/static/<fname>")
+        def static_asset(fname):
+            # Whitelist lookup - only known vendored assets are served,
+            # which also rules out any path traversal.
+            urls = dict(WEBGUI_ASSETS)
+            if fname not in urls:
+                return Response("Not found", status=404)
+            path = find_webgui_asset(fname)
+            if path:
+                with open(path, "rb") as f:
+                    body = f.read()
+                return Response(body, mimetype="text/javascript",
+                                headers={"Cache-Control":
+                                         "public, max-age=86400"})
+            # Not vendored (yet) - graceful fallback to pinned CDN URL
+            # so the dashboard still works while online.
+            return Response(status=302, headers={"Location": urls[fname]})
 
         @app.route("/events")
         def events():
@@ -3758,6 +3882,11 @@ class WebGUI:
     # ------------------------------------------------------------------
 
     def start(self):
+        # Auto-fetch missing Chart.js assets in the background (offline-first;
+        # non-fatal when no internet - dashboard falls back to CDN redirect).
+        threading.Thread(target=ensure_webgui_assets,
+                         kwargs={"notify_fn": self.bus.notify},
+                         daemon=True, name="webgui-assets").start()
         t = threading.Thread(
             target=lambda: self.app.run(
                 host=self.host, port=self.port,
@@ -3977,10 +4106,21 @@ def main():
         bus.webgui  = webgui
         webgui.start()
 
+    retry_s = max(cfg.getfloat("can", "connect_retry_interval",
+                               fallback=10.0), 1.0)
     if not bus.connect():
-        print("[flatpack2] FATAL: Cannot connect to CAN adapter.")
-        log.error("Cannot connect to CAN adapter")
-        sys.exit(1)
+        log.warning("CAN adapter not found - retrying every "
+                    "{:.0f}s".format(retry_s))
+        print("[flatpack2] CAN adapter not found - waiting for it "
+              "(retry every {:.0f}s, Ctrl+C to abort)...".format(retry_s))
+        try:
+            while not bus.connect():
+                time.sleep(retry_s)
+        except KeyboardInterrupt:
+            print("\n[flatpack2] Aborted while waiting for CAN adapter.")
+            sys.exit(1)
+        log.info("CAN adapter found after retry")
+        print("[flatpack2] CAN adapter found.")
 
     print("[flatpack2] CAN adapter connected, starting threads...")
     bus.start()
@@ -3994,8 +4134,29 @@ def main():
             print("[flatpack2] Auto-start: starting charging...")
             bus.charger.start(psu_ids)
         else:
-            log.warning("Auto-start: no PSUs found, skipping")
-            print("[flatpack2] Auto-start: no PSUs found, charging skipped")
+            log.warning("Auto-start: no PSUs yet - charging will start "
+                        "when a PSU appears")
+            print("[flatpack2] Auto-start: no PSUs found - charging will "
+                  "start automatically when a PSU comes online")
+
+            def _deferred_autostart():
+                # One-shot waiter: the rx loop keeps discovering PSUs even
+                # after the initial discovery timeout. When the first PSU
+                # appears, let it stabilize, then start charging - unless
+                # the user already started it manually. Runs at most once;
+                # a later manual 'charge stop' is never overridden.
+                while bus._running:
+                    if bus._id_map:
+                        time.sleep(3.0)   # settle: login + config apply
+                        if not bus.charger.state.is_active():
+                            bus.notify("Auto-start: PSU discovered - "
+                                       "starting charging", "info")
+                            bus.charger.start(list(bus._id_map.keys()))
+                        return
+                    time.sleep(2.0)
+
+            threading.Thread(target=_deferred_autostart, daemon=True,
+                             name="autostart-wait").start()
 
     # Run CLI
     try:

@@ -135,6 +135,40 @@ cp requirements.txt "${INSTALL_DIR}/requirements.txt"
 success "Program files copied to ${INSTALL_DIR}"
 
 # ---------------------------------------------------------------------------
+# Web-GUI JS assets (Chart.js) - vendored for fully offline operation.
+# Non-fatal when offline: flatpack2 retries the download automatically on
+# every start, and the dashboard falls back to the CDN while online.
+# ---------------------------------------------------------------------------
+info "Downloading Web-GUI JS assets (for offline dashboard graph)..."
+STATIC_DIR="${INSTALL_DIR}/static"
+mkdir -p "${STATIC_DIR}"
+ASSET_URLS=(
+    "https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"
+    "https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"
+)
+ASSETS_OK=true
+for url in "${ASSET_URLS[@]}"; do
+    fname="$(basename "${url}")"
+    if [[ -s "${STATIC_DIR}/${fname}" ]]; then
+        info "  ${fname} already present - keeping"
+        continue
+    fi
+    if curl -fsSL --connect-timeout 15 -o "${STATIC_DIR}/${fname}.part" "${url}" \
+       && [[ "$(stat -c%s "${STATIC_DIR}/${fname}.part" 2>/dev/null || echo 0)" -gt 10240 ]]; then
+        mv "${STATIC_DIR}/${fname}.part" "${STATIC_DIR}/${fname}"
+        success "  ${fname} downloaded"
+    else
+        rm -f "${STATIC_DIR}/${fname}.part"
+        ASSETS_OK=false
+        warn "  ${fname} download FAILED (offline?)"
+    fi
+done
+if [[ "${ASSETS_OK}" != "true" ]]; then
+    warn "Web-GUI assets incomplete - dashboard graph needs internet until"
+    warn "flatpack2 manages to download them on a later (online) start."
+fi
+
+# ---------------------------------------------------------------------------
 # Config files - only copy if not already present (preserve user edits)
 # ---------------------------------------------------------------------------
 info "Checking config files..."
