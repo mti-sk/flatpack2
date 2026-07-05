@@ -24,22 +24,29 @@ Full text: [`DISCLAIMER.md`](DISCLAIMER.md)
 - **CAN communication** via Waveshare USB-CAN-A (native binary protocol, not slcan)
 - **Auto-detection** of adapter by USB VID:PID `1a86:7523`
 - **Virtual PTY terminal** – connect with `screen /tmp/flatpack2.pty` from any SSH session
-- **Web-GUI dashboard** – mobile-first dark theme, live SSE updates every 10 s
+  - **Top status bar** for warnings/errors (PSU ALARM, CAN loss/reconnect, charger error stops) – color-coded, timestamped, drawn on row 1 via ANSI scroll region so async events never corrupt the prompt
+- **Web-GUI dashboard** – mobile-first dark theme, live SSE updates every 3 s (configurable `sse_interval`)
+  - Live Vout·Iout in the header at all times; Ah·Wh added in charger mode
   - PSU status (Vout, Iout, Vin, temperatures, mode)
   - Set voltage / current with confirmation dialog
-  - **Standby button** – sets PSU to 48.0 V / 0.1 A safe idle state
-  - LiFePO4 charger control (start / stop / progress bar)
+  - **Standby button** – sets PSU to 48.0 V / 0.1 A safe idle state (values shown inline)
+  - LiFePO4 charger control (start / stop / **change current** / **reset** / SOC progress bar / stop reason)
   - **Battery parameters card** – static config overview (cells, voltages, currents, limits)
   - Live graphs: Vout+Iout, Delivered capacity [Ah], Delivered energy [Wh] – time window 15 min / 1 h / 12 h
   - CC→CV transition annotation in graph
   - Live log tail
   - CSV history export (`/api/history`)
+- **CSV history persistence** (optional) – samples written to disk (buffered),
+  last 12 h reloaded into the graphs on restart, automatic retention trim
 - **LiFePO4 CC/CV charger** with soft-start and safe battery detection
   - DETECT phase: PSU holds low `detect_voltage` at minimal `detect_current`; battery detected via voltage rise on output (no inrush current)
   - RAMP phase: voltage stepped up from V_bat to target in configurable steps; avoids inrush spikes on connection
   - CC phase: constant current until target voltage reached
   - CV phase: voltage held, current tapers until `charge_current_tail`
-  - Battery disconnect during RAMP returns to DETECT automatically
+  - **Battery-disconnect detection in every phase** (RAMP/CC/CV) returns to DETECT automatically; Ah/Wh counters are preserved
+  - **Change charge current on the fly** and **reset** the cycle (CLI + Web-GUI)
+  - **Rough SOC estimate** – OCV anchor at detection + coulomb counting
+  - **ALARM safety** – PSU alarm in any phase aborts the charge and puts the PSU into standby (manual restart required)
   - **Auto-start** on program startup and after CAN reconnect (configurable)
 - **Standby mode** – sets PSU to 48.0 V / 0.1 A; overwrites restore values so reconnect keeps standby
 - **Value restore on reconnect** – last set voltage/current automatically re-applied after CAN bus recovery
@@ -293,7 +300,10 @@ safety_time_limit    = 1200     # minutes (20 h) – counted from RAMP start
 detect_voltage       = 48.0     # V – PSU output during DETECT phase
 detect_current       = 0.2      # A – PSU current during DETECT phase
 detect_threshold     = 1.0      # V – vout must exceed detect_voltage + detect_threshold
-min_current_detect   = 0.5      # A – secondary confirmation: iout threshold after detection
+min_current_detect   = 0.5      # A – detection confirmation AND "current collapsed"
+                                # threshold for battery-disconnect detection in CC/CV
+disconnect_detect_time = 5.0    # s – iout must stay below min_current_detect this long
+                                # in CC before the battery is deemed disconnected
 ramp_step_voltage    = 0.1      # V per ramp step
 ramp_step_interval   = 5.0      # seconds between ramp steps
 voltage_tolerance    = 0.1      # V – CC→CV transition threshold
@@ -308,10 +318,10 @@ auto_start           = true     # start charging automatically on program start
 |-------|-------------|
 | **detect** | PSU holds `detect_voltage` at `detect_current`. Battery detected when `vout > detect_voltage + detect_threshold`. No inrush current. |
 | **ramp** | Voltage steps up from V_bat by `ramp_step_voltage` every `ramp_step_interval` s. Transitions to CC when `iout >= charge_current`, or to CV when target reached. Battery disconnect returns to detect. |
-| **CC** | Full `charge_current` applied. Ends when `vout >= target_voltage - voltage_tolerance`. |
-| **CV** | Target voltage held. Current tapers naturally. |
-| **done** | Charging finished when `iout <= charge_current_tail`. |
-| **error** | Stopped due to alarm, high temp, or safety timeout. |
+| **CC** | Full `charge_current` applied (PSU in current limit). The voltage setpoint keeps stepping by `ramp_step_voltage` up to `target_voltage` – it is never jumped in one step, which would make the PSU's current limiter overshoot and overload the unit. Ends when `vout >= target_voltage - voltage_tolerance`. If current collapses to ≤ `min_current_detect` for `disconnect_detect_time` s, the battery is deemed disconnected and the charger returns to **detect** (Ah/Wh preserved). |
+| **CV** | Target voltage held. A gradual taper to `charge_current_tail` ends the charge (**done**); a sudden current collapse is treated as a disconnect and returns to **detect**. |
+| **done** | Charging finished when `iout <= charge_current_tail` via a normal taper. |
+| **error** | Stopped due to PSU ALARM (any phase), high temp, or safety timeout. Requires a manual `charge start` / `charge reset` to clear. |
 
 #### Auto-start behaviour
 
@@ -319,6 +329,55 @@ When `auto_start = true` (default):
 - Charging starts automatically after PSU discovery on program startup.
 - After a CAN bus reconnect, charging resumes automatically **only if it was active** before the disconnection. If the user stopped charging manually before the outage, it will **not** restart.
 - When auto-start is active, `apply_on_start` in `[PSU_x]` sections is effectively superseded by the charger.
+
+#### Changing the charge current / resetting
+
+The charge current can be changed at any time without stopping the cycle:
+`charge current <A>` (CLI) or the **Set I** button in the Web-GUI. In RAMP/CC/CV
+the new current is sent to the PSU immediately; in DETECT it is stored and used
+once the battery is detected.
+
+`charge reset` (CLI) / **Reset** button clears the Ah/Wh counters, restores the
+charge current to the config default and restarts the cycle from DETECT. Note
+that a battery disconnect during charging does **not** clear Ah/Wh – only an
+explicit reset does.
+
+#### SOC estimate
+
+The reported state-of-charge is a **rough estimate**, always labelled as such.
+LiFePO4 has a very flat voltage curve and the voltage is elevated under charge
+current, so voltage alone is unreliable. Instead:
+- at battery detection the current is near zero, so `vout ≈ OCV`; a per-cell
+  OCV→SOC table (linear interpolation) gives the starting SOC,
+- from there the estimate tracks by coulomb counting (`charged Ah / capacity`),
+- in CV it is pulled toward 100 % as the current tapers to `charge_current_tail`.
+
+Accuracy depends on a correct `capacity` value and on the battery resting near
+OCV at detection; treat it as indicative, not a fuel gauge.
+
+---
+
+## History persistence (CSV)
+
+By default the measurement history lives only in RAM (12 h ring buffer). Enable
+persistence to keep it across restarts:
+
+```ini
+[history]
+persist        = true                        # off by default
+file           = /var/log/flatpack2_history.csv
+flush_interval = 60                           # s – buffered writes to spare flash
+retention_days = 30                           # rows older than this trimmed at startup
+```
+
+- Columns: `timestamp_ms,vout,iout,ah,wh`.
+- Writes are buffered and flushed every `flush_interval` seconds (and once on
+  shutdown) to avoid hammering an SD card / flash storage.
+- On startup the last 12 h are loaded back into the graphs, and rows older than
+  `retention_days` are dropped (atomic rewrite via a temp file).
+- The bundled `flatpack2_charger.conf` enables persistence; `flatpack2.conf`
+  ships it enabled too. Set `persist = false` to keep the previous
+  RAM-only behaviour.
 
 ---
 
@@ -378,7 +437,9 @@ map                     Show serial → ID mapping
 
 charge start [I]        Start LiFePO4 charging (optional current override)
 charge stop             Stop charging
-charge status           Show charge status
+charge current <A>      Change charge current while charging
+charge reset            Clear Ah/Wh, restore default current, restart from DETECT
+charge status           Show charge status (incl. SOC estimate)
 charge monitor          Continuous monitor (Enter to stop)
 charge config           Show charger configuration
 charge battery          Show battery parameters (static config)
@@ -397,6 +458,8 @@ standby 1
 map
 charge start
 charge start 15.0
+charge current 20.0
+charge reset
 charge status
 charge battery
 charge monitor
@@ -411,12 +474,14 @@ All endpoints return JSON unless noted.
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/` | Dashboard HTML |
-| GET | `/events` | SSE stream (10 s interval) |
+| GET | `/events` | SSE stream (interval = `sse_interval`, default 3 s) |
 | GET | `/api/status` | Single status snapshot (JSON) |
 | POST | `/api/set` | Set voltage/current |
 | POST | `/api/standby` | Set PSU to standby (48.0 V / 0.1 A) |
 | POST | `/api/charge/start` | Start charging |
 | POST | `/api/charge/stop` | Stop charging |
+| POST | `/api/charge/current` | Change charge current while charging |
+| POST | `/api/charge/reset` | Clear Ah/Wh, restore default current, restart from DETECT |
 | GET | `/api/history` | Download history as CSV |
 
 **POST /api/set**
@@ -427,6 +492,16 @@ All endpoints return JSON unless noted.
 **POST /api/charge/start**
 ```json
 { "current": 15.0 }   // optional; omit to use config default
+```
+
+**POST /api/charge/current**
+```json
+{ "current": 20.0 }   // required; must be within the PSU current limit
+```
+
+**POST /api/charge/reset**
+```json
+{}   // no body required
 ```
 
 **POST /api/standby**

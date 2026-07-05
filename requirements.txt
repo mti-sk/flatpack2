@@ -1,4 +1,4 @@
-# flatpack2 v2.9.5 dependencies
+# flatpack2 dependencies
 # Install: pip install -r requirements.txt
 
 # CAN adapter communication (serial port)

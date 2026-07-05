@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# flatpack2 v2.9.5 - 2026
+# flatpack2 v3.0.2 - 2026
 #
 # Copyright (c) 2026 mti@mti.sk
 # Coded by Claude Sonnet 4.6
@@ -8,7 +8,7 @@
 # MIT License - see LICENSE file for details
 # https://github.com/mti-sk/flatpack2
 """
-flatpack2 v2.9.5 - CLI + Web-GUI controller for Eltek Flatpack2 PSU via CAN bus
+flatpack2 v3.0.2 - CLI + Web-GUI controller for Eltek Flatpack2 PSU via CAN bus
 See README.md for full documentation, API reference and known issues.
 
 Supports Waveshare USB-CAN-A adapter (STM32, CH341, native binary protocol).
@@ -68,7 +68,7 @@ import datetime
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-VERSION = "2.9.5"
+VERSION = "3.0.2"
 
 # ---------------------------------------------------------------------------
 # Flatpack2 hardware limits (48V family)
@@ -204,11 +204,18 @@ def load_config(path="flatpack2.conf"):
             "host": "0.0.0.0",
             "port": "8080",
             "log_access": "true",
+            "sse_interval": "3",
         },
         "psu": {
             "ovp_voltage": "60.0",
             "discovery_timeout": "10",
             "power_rating": "2000",
+        },
+        "history": {
+            "persist": "false",
+            "file": "/var/log/flatpack2_history.csv",
+            "flush_interval": "60",
+            "retention_days": "30",
         },
     })
 
@@ -423,6 +430,7 @@ class PSUState:
         self.last_set_voltage = None   # last successfully sent voltage (for reconnect restore)
         self.last_set_current = None   # last successfully sent current (for reconnect restore)
         self.start_applied= False  # apply_on_start already done
+        self.alarm_latched= False  # ALARM safety action already taken (edge trigger)
 
     @property
     def serial_hex(self):
@@ -628,6 +636,33 @@ class FlatpackBus:
             ts = datetime.datetime.now().strftime("%H:%M:%S")
             self.webgui.add_log_line("{} {}".format(ts, msg.strip()))
 
+    def notify(self, msg, level="warning"):
+        """
+        Report a warning/error/info event to the user.
+
+        Routes the message to the terminal's top status bar (PTY mode)
+        instead of interleaving it into the CLI output, which used to
+        corrupt the prompt. Falls back to a plain async print when the
+        terminal has no status line (stdio mode). Always logs and feeds
+        the Web-GUI log buffer.
+        """
+        if level == "error":
+            log.error(msg)
+        elif level == "info":
+            log.info(msg)
+        else:
+            log.warning(msg)
+
+        term = self.terminal
+        if term is not None and hasattr(term, "set_status"):
+            term.set_status(msg, level)
+            if self.webgui is not None:
+                ts = datetime.datetime.now().strftime("%H:%M:%S")
+                self.webgui.add_log_line("{} {}: {}".format(ts, level.upper(), msg))
+        else:
+            # _print feeds the Web-GUI log buffer itself
+            self._print("\n[flatpack2] {}: {}".format(level.upper(), msg))
+
     # ------------------------------------------------------------------
     # Connection
     # ------------------------------------------------------------------
@@ -665,7 +700,7 @@ class FlatpackBus:
             self._reconnect_lock.release()
 
     def _do_reconnect(self):
-        log.warning("CAN bus error - attempting reconnect...")
+        self.notify("CAN bus error - attempting reconnect...", "error")
         self._connected = False
 
         # Remember charger state before disconnect so we can resume if needed
@@ -695,8 +730,7 @@ class FlatpackBus:
                 )
             if self.adapter.connect():
                 self._connected = True
-                log.info("Reconnected on {}".format(port))
-                self._print("\n[flatpack2] CAN bus reconnected on {}".format(port))
+                self.notify("CAN bus reconnected on {}".format(port), "info")
                 # Reset tracking so _startup_apply_loop will re-apply values.
                 # last_set_voltage/current are intentionally preserved.
                 for psu in list(self.psus.values()):
@@ -1015,8 +1049,25 @@ class FlatpackBus:
             self._send(ALERT_ARB, bytes([0x08, alert_type, 0x00]))
 
         if yy == STATUS_ALARM:
-            self._print("\n[flatpack2] !! PSU ID={} ALARM!".format(psu.psu_id))
-            log.warning("PSU ID={} ALARM".format(psu.psu_id))
+            # Edge-triggered safety action: ALARM status repeats every second,
+            # so react only on the transition into alarm.
+            if not psu.alarm_latched:
+                psu.alarm_latched = True
+                if self.charger is not None and self.charger.state.is_active():
+                    # Charger error stop already puts the PSU into standby
+                    # (works in ALL phases incl. DETECT/RAMP) and reports the
+                    # reason via bus.notify(). Charger stays in ERROR until
+                    # manual Start/Reset - no auto-restart.
+                    self.charger.abort("PSU ID={} ALARM - charging stopped".format(
+                        psu.psu_id))
+                else:
+                    self.notify("PSU ID={} ALARM -> standby "
+                                "({:.1f}V / {:.1f}A)".format(
+                                    psu.psu_id, STANDBY_VOLTAGE, STANDBY_CURRENT),
+                                "error")
+                    self.cmd_standby()
+        else:
+            psu.alarm_latched = False
 
         # Feed history ring buffer
         if self.history is not None:
@@ -1044,18 +1095,22 @@ class FlatpackBus:
             if b1 & (1 << bit): active.append(ALERT_BYTE1[bit])
             if b2 & (1 << bit): active.append(ALERT_BYTE2[bit])
 
+        # Alert responses repeat every second (request is sent on every CC/ALARM
+        # STATUS frame). Notify only when the active set CHANGES - the status
+        # bar keeps showing the last message, so no repetition is needed and
+        # the CLI is no longer flooded once per second.
         if alert_type == 0x04:
+            changed = active != psu.warnings
             psu.warnings = active
-            if active:
-                msg = "PSU ID={} WARNINGS: {}".format(psu.psu_id, ", ".join(active))
-                log.warning(msg)
-                self._print("\n[flatpack2] WARNING: " + msg)
+            if active and changed:
+                self.notify("PSU ID={} WARNING: {}".format(
+                    psu.psu_id, ", ".join(active)), "warning")
         else:
+            changed = active != psu.alarms
             psu.alarms = active
-            if active:
-                msg = "PSU ID={} ALARMS: {}".format(psu.psu_id, ", ".join(active))
-                log.error(msg)
-                self._print("\n[flatpack2] ALARM: " + msg)
+            if active and changed:
+                self.notify("PSU ID={} ALARM: {}".format(
+                    psu.psu_id, ", ".join(active)), "error")
 
     # ------------------------------------------------------------------
     # User commands
@@ -1176,6 +1231,13 @@ class PTYTerminal:
     _ERASE_LINE  = "\r\033[K"   # move to col 0, erase to end of line
     _CRLF        = "\r\n"
 
+    # Status line colors (row 1 bar): level -> SGR sequence
+    _STATUS_COLORS = {
+        "error":   "\033[1;97;41m",   # bold white on red
+        "warning": "\033[30;43m",     # black on yellow
+        "info":    "\033[30;46m",     # black on cyan
+    }
+
     def __init__(self, symlink=None):
         self.symlink         = symlink
         self.master_fd       = None
@@ -1188,6 +1250,13 @@ class PTYTerminal:
         self._current_input  = ""
         self._reader_thread  = None
         self._reader_stop    = threading.Event()
+        # Top status line (warnings/errors) - drawn on row 1 with a DECSTBM
+        # scroll region protecting it, so async alerts no longer interleave
+        # with (and corrupt) the CLI prompt.
+        self._status_text    = None
+        self._status_level   = "info"
+        self._rows           = 24
+        self._cols           = 80
 
     # ------------------------------------------------------------------
     # Open / close / disconnect
@@ -1228,6 +1297,13 @@ class PTYTerminal:
 
     def close(self):
         """Full shutdown - stop reader thread, close PTY and remove symlink."""
+        # Release the scroll region so an attached screen session is left
+        # in a clean state (no-op if the status bar was never drawn).
+        if self._status_text is not None:
+            try:
+                self.clear_status()
+            except OSError:
+                pass
         self._reader_stop.set()
         self._input_event.set()  # unblock readline()
         if self._reader_thread and self._reader_thread.is_alive():
@@ -1300,6 +1376,7 @@ class PTYTerminal:
             TIOCSWINSZ = 0x5414  # Linux
             buf = array.array('H', [rows, cols, 0, 0])
             fcntl.ioctl(fd, TIOCSWINSZ, buf)
+            self._rows, self._cols = rows, cols   # remembered for status line
             log.debug("PTY winsize set: {}x{}".format(cols, rows))
         except (OSError, AttributeError) as e:
             log.debug("Cannot set PTY winsize: {}".format(e))
@@ -1337,6 +1414,7 @@ class PTYTerminal:
                     rows, cols = size
                     self._set_winsize(self.master_fd, rows, cols)
                     log.debug("PTY resized: {}x{}".format(cols, rows))
+                    self._draw_status()   # re-fit scroll region + status bar
                     return
             except (OSError, AttributeError):
                 continue
@@ -1385,6 +1463,50 @@ class PTYTerminal:
         """Track current prompt and partial input for async redraw."""
         self._current_prompt = prompt
         self._current_input  = current_input
+
+    # ------------------------------------------------------------------
+    # Top status line (warnings / errors)
+    # ------------------------------------------------------------------
+
+    def set_status(self, text, level="warning"):
+        """
+        Show a message in a persistent status bar on terminal row 1.
+
+        Uses a DECSTBM scroll region (rows 2..N) so normal CLI output
+        scrolls *below* the bar and background warnings/errors no longer
+        interleave with the prompt. Each call redraws the bar with a
+        fresh timestamp; repeated alerts (e.g. 'Current Limit' every
+        second in CC mode) just update one line instead of flooding
+        the terminal.
+        """
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self._status_text  = "{} {}: {}".format(ts, level.upper(), text)
+        self._status_level = level
+        self._draw_status()
+
+    def clear_status(self):
+        """Remove the status bar and release the scroll region."""
+        if self.master_fd is None:
+            return
+        self._status_text = None
+        # reset scroll region, clear row 1
+        self.write("\0337\033[r\033[1;1H\033[2K\0338")
+
+    def _draw_status(self):
+        """(Re)draw the status bar. Re-asserts the scroll region on every
+        draw so it also survives a screen (re)attach."""
+        if self.master_fd is None or not self._status_text:
+            return
+        rows  = max(self._rows, 2)
+        cols  = max(self._cols, 20)
+        line  = (" " + self._status_text)[:cols].ljust(cols)
+        color = self._STATUS_COLORS.get(self._status_level, "\033[7m")
+        seq = ("\0337"                       # save cursor position
+               "\033[2;{}r".format(rows) +   # scroll region rows 2..N (protects row 1)
+               "\033[1;1H" +                 # jump to status row
+               color + line + "\033[0m" +
+               "\0338")                      # restore cursor position
+        self.write(seq)
 
     # ------------------------------------------------------------------
     # Input reader
@@ -1512,6 +1634,7 @@ def get_charger_config(cfg):
     c["voltage_tolerance"]    = cfg.getfloat("charger", "voltage_tolerance",    fallback=0.1)
     c["monitor_interval"]     = cfg.getfloat("charger", "monitor_interval",     fallback=5.0)
     c["auto_start"]           = cfg.getboolean("charger", "auto_start",         fallback=True)
+    c["disconnect_detect_time"] = cfg.getfloat("charger", "disconnect_detect_time", fallback=5.0)
     # Derived
     c["target_voltage"] = round(c["cell_count"] * c["cell_voltage_max"], 3)
     return c
@@ -1540,6 +1663,12 @@ class ChargerState:
         self.stop_reason   = None
         self.active_psus   = []     # list of psu_ids participating in charge
         self.ramp_voltage  = None   # current V_set during RAMP phase
+        self.run_id        = 0      # generation counter - stale threads exit on mismatch
+        self.soc_start     = None   # SOC estimate [%] from OCV at battery detection
+        self.soc_ah_base   = 0.0    # Ah value at the moment soc_start was estimated
+        self.cv_entry_current = None  # total Iout at CV entry (for SOC taper estimate)
+        self.low_current_since = None # timestamp when Iout dropped below threshold in CC
+        self.prev_total_iout   = None # previous total Iout (CV sudden-drop detection)
 
     @property
     def elapsed_minutes(self):
@@ -1574,6 +1703,60 @@ class Charger:
         self._print   = print_fn
         self.state    = ChargerState()
         self._lock    = threading.Lock()
+        self._run_seq = 0    # monotonic generation counter for detect/ramp threads
+
+    # ------------------------------------------------------------------
+    # SOC estimation (rough)
+    # ------------------------------------------------------------------
+    # LiFePO4 open-circuit voltage vs SOC (per cell, resting). The curve is
+    # very flat between 20-90%, so this is only a rough anchor; the running
+    # estimate is coulomb counting from the detected starting point.
+    _OCV_TABLE = [
+        (2.80,   0.0), (3.00,   5.0), (3.12,  10.0), (3.22,  20.0),
+        (3.25,  30.0), (3.27,  40.0), (3.28,  50.0), (3.29,  60.0),
+        (3.30,  70.0), (3.32,  80.0), (3.35,  90.0), (3.40, 100.0),
+    ]
+
+    @classmethod
+    def _soc_from_ocv(cls, cell_v):
+        """Linear interpolation in the OCV table. Returns SOC in %."""
+        table = cls._OCV_TABLE
+        if cell_v <= table[0][0]:
+            return 0.0
+        if cell_v >= table[-1][0]:
+            return 100.0
+        for i in range(1, len(table)):
+            v0, s0 = table[i - 1]
+            v1, s1 = table[i]
+            if cell_v <= v1:
+                return s0 + (s1 - s0) * (cell_v - v0) / (v1 - v0)
+        return 100.0
+
+    def estimate_soc(self, total_iout=None):
+        """
+        Rough SOC estimate [%] or None if unknown.
+          - anchor: OCV lookup at battery detection (near-zero current)
+          - tracking: coulomb counting (charged Ah / capacity)
+          - CV phase: pulled toward 100% as the current tapers to tail
+          - DONE: 100%
+        """
+        s = self.state
+        if s.phase == ChargePhase.DONE:
+            return 100.0
+        if s.soc_start is None:
+            return None
+        soc = s.soc_start
+        cap = self.cfg["capacity"]
+        if cap > 0:
+            soc += (s.ah - s.soc_ah_base) / cap * 100.0
+        if s.phase == ChargePhase.CV and total_iout is not None and \
+           s.cv_entry_current is not None:
+            tail = self.cfg["charge_current_tail"]
+            span = max(s.cv_entry_current - tail, 0.1)
+            frac = max(0.0, min(1.0, (total_iout - tail) / span))  # 1=CV entry, 0=tail
+            soc  = max(soc, 100.0 - 5.0 * frac)   # taper maps onto 95-100%
+        cap_limit = 99.9 if s.is_active() else 100.0
+        return max(0.0, min(soc, cap_limit))
 
     # ------------------------------------------------------------------
     # Integration - called from FlatpackBus._handle_status
@@ -1596,45 +1779,84 @@ class Charger:
 
             now = time.time()
 
+            # Total current across all active PSUs (used by several checks below)
+            total_iout = sum(
+                self.bus.psus[self.bus._id_map[pid]].iout
+                for pid in self.state.active_psus
+                if pid in self.bus._id_map and
+                   self.bus._id_map[pid] in self.bus.psus
+            )
+
             # Integrate Ah/Wh only when triggered by the first active PSU,
             # to avoid counting multiple times per interval with multiple PSUs.
             first_pid = self.state.active_psus[0] if self.state.active_psus else None
             if psu.psu_id == first_pid and self.state.last_status_t is not None:
                 dt = now - self.state.last_status_t
                 if 0 < dt < 2.0:   # sanity: ignore gaps > 2s
-                    total_iout = sum(
-                        self.bus.psus[self.bus._id_map[pid]].iout
-                        for pid in self.state.active_psus
-                        if pid in self.bus._id_map and
-                           self.bus._id_map[pid] in self.bus.psus
-                    )
                     self.state.ah += total_iout * dt / 3600.0
                     self.state.wh += total_iout * psu.vout * dt / 3600.0
 
             if psu.psu_id == first_pid:
                 self.state.last_status_t = now
 
-            # Phase transition CC -> CV
             target = self.cfg["target_voltage"]
             tol    = self.cfg["voltage_tolerance"]
+
+            # CC phase
             if self.state.phase == ChargePhase.CC:
+                # Battery disconnect detection: current collapses to ~0 and
+                # stays there for disconnect_detect_time seconds. (A connected
+                # battery in CC always draws the full charge current.)
+                if total_iout <= self.cfg["min_current_detect"]:
+                    if self.state.low_current_since is None:
+                        self.state.low_current_since = now
+                    elif now - self.state.low_current_since >= \
+                            self.cfg["disconnect_detect_time"]:
+                        self._return_to_detect(
+                            "Battery disconnected during CC "
+                            "(Iout={:.2f}A for {:.0f}s)".format(
+                                total_iout, now - self.state.low_current_since))
+                        return
+                else:
+                    self.state.low_current_since = None
+
+                # Phase transition CC -> CV
                 if psu.vout >= target - tol:
-                    self.state.phase = ChargePhase.CV
+                    # If the CC setpoint ramp hasn't quite finished, send the
+                    # final target now. vout >= target - tol implies the
+                    # setpoint is already within tol of target, so this is a
+                    # <= voltage_tolerance step - no overshoot risk.
+                    if self.state.ramp_voltage is not None and \
+                            self.state.ramp_voltage < target:
+                        self.bus.cmd_set(target, self.state.charge_current)
+                    self.state.phase             = ChargePhase.CV
+                    self.state.ramp_voltage      = None
+                    self.state.low_current_since = None
+                    self.state.cv_entry_current  = total_iout
+                    self.state.prev_total_iout   = None
                     self._print("[charger] CC -> CV phase (Vout={:.2f}V target={:.2f}V)".format(
                         psu.vout, target), async_msg=True)
                     log.info("Charger CC->CV: Vout={:.2f}V".format(psu.vout))
                     if self.bus.webgui is not None:
                         self.bus.webgui.mark_cc_to_cv()
 
-            # End of charge detection in CV phase
+            # CV phase: end-of-charge vs battery disconnect
             if self.state.phase == ChargePhase.CV:
-                total_iout = sum(
-                    self.bus.psus[self.bus._id_map[pid]].iout
-                    for pid in self.state.active_psus
-                    if pid in self.bus._id_map and
-                       self.bus._id_map[pid] in self.bus.psus
-                )
-                if total_iout <= self.cfg["charge_current_tail"]:
+                prev = self.state.prev_total_iout
+                self.state.prev_total_iout = total_iout
+                tail = self.cfg["charge_current_tail"]
+                if total_iout <= tail:
+                    # Sudden collapse (e.g. 20A -> 0A between two STATUS
+                    # frames) means the battery was disconnected - a real
+                    # end-of-charge is a gradual taper through the tail value.
+                    sudden = (prev is not None and
+                              prev > tail * 1.5 and
+                              total_iout <= self.cfg["min_current_detect"])
+                    if sudden:
+                        self._return_to_detect(
+                            "Battery disconnected during CV "
+                            "(Iout {:.1f}A -> {:.2f}A)".format(prev, total_iout))
+                        return
                     self._finish("Charge complete (tail current {:.1f}A)".format(total_iout))
                     return
 
@@ -1644,11 +1866,8 @@ class Charger:
                              error=True)
                 return
 
-            # Safety: PSU alarm or high temp (checked via psu.alarms/warnings)
-            if psu.status == 0x0C:  # STATUS_ALARM
-                self._finish("PSU ID={} ALARM - charging stopped".format(psu.psu_id),
-                             error=True)
-                return
+            # Safety: high temp. (PSU ALARM status is handled centrally in
+            # FlatpackBus._handle_status for ALL phases, incl. DETECT/RAMP.)
             if any("High Temp" in w for w in psu.warnings + psu.alarms):
                 self._finish("PSU ID={} High Temp - charging stopped".format(psu.psu_id),
                              error=True)
@@ -1665,30 +1884,107 @@ class Charger:
         Enters DETECT phase first (PSU at detect_voltage / detect_current),
         then RAMP (soft-start), then CC/CV.
         """
+        return self._begin(psu_ids, current=current, force=False)
+
+    def reset(self):
+        """
+        Reset charger: clear Ah/Wh counters, restore charge current to the
+        config default and restart from the DETECT phase. Works in any phase
+        (active charging is superseded, stale threads exit via run_id).
+        """
+        psu_ids = list(self.bus._id_map.keys())
+        if not psu_ids:
+            self._print("[charger] ERROR: No PSUs discovered yet.", async_msg=False)
+            return False
+        self._print("[charger] Reset: Ah/Wh cleared, current restored to {:.1f}A, "
+                    "restarting from DETECT".format(self.cfg["charge_current"]),
+                    async_msg=False)
+        log.info("Charger reset requested")
+        return self._begin(psu_ids, current=None, force=True)
+
+    def set_current(self, amps):
+        """
+        Change the charge current while charging is active.
+        Takes effect immediately in RAMP/CC/CV (re-sends the SET frame with
+        the current voltage setpoint); in DETECT it is stored and used once
+        the battery is detected.
+        """
+        if not (0 < amps <= PSU_I_MAX):
+            self._print("[charger] ERROR: Current {:.1f}A out of range "
+                        "(0-{:.1f}A)".format(amps, PSU_I_MAX), async_msg=False)
+            return False
         with self._lock:
-            if self.state.is_active():
+            if not self.state.is_active():
+                self._print("[charger] Not charging - use 'charge start {:.1f}' "
+                            "instead.".format(amps), async_msg=False)
+                return False
+            self.state.charge_current = amps
+            phase  = self.state.phase
+            ramp_v = self.state.ramp_voltage
+
+        ok = True
+        if phase == ChargePhase.CV:
+            ok = self.bus.cmd_set(self.cfg["target_voltage"], amps)
+        elif phase == ChargePhase.CC:
+            # Use the CURRENT voltage setpoint, not the final target - during
+            # the CC setpoint ramp the setpoint may still be volts below
+            # target and jumping it would provoke the same current-limiter
+            # overshoot as the RAMP->CC bug fixed in 3.0.2.
+            v = ramp_v if ramp_v is not None else self.cfg["target_voltage"]
+            ok = self.bus.cmd_set(v, amps)
+        elif phase == ChargePhase.RAMP and ramp_v is not None:
+            ok = self.bus.cmd_set(ramp_v, amps)
+        # DETECT: nothing to send now - detect_current stays in effect,
+        # the new value is applied when RAMP starts.
+
+        if ok:
+            self._print("[charger] Charge current changed to {:.1f}A "
+                        "(phase: {})".format(amps, phase), async_msg=False)
+            log.info("Charger current changed to {:.1f}A (phase {})".format(amps, phase))
+        else:
+            self._print("[charger] ERROR: CAN send failed while changing current",
+                        async_msg=False)
+        return ok
+
+    def abort(self, reason):
+        """
+        Externally triggered error stop (e.g. PSU ALARM). Safe to call in any
+        phase; no-op when charging is not active. Sets PSU to standby values.
+        """
+        with self._lock:
+            if not self.state.is_active():
+                return
+            self._finish(reason, error=True)
+
+    def _begin(self, psu_ids, current=None, force=False):
+        """Common start path for start() and reset()."""
+        charge_current = current if current is not None else self.cfg["charge_current"]
+        target_voltage = self.cfg["target_voltage"]
+
+        if charge_current > PSU_I_MAX:
+            self._print("[charger] ERROR: Current {:.1f}A exceeds PSU max {:.1f}A".format(
+                charge_current, PSU_I_MAX), async_msg=False)
+            return False
+        if target_voltage > PSU_V_MAX:
+            self._print("[charger] ERROR: Target {:.2f}V exceeds PSU max {:.1f}V".format(
+                target_voltage, PSU_V_MAX), async_msg=False)
+            return False
+
+        with self._lock:
+            if not force and self.state.is_active():
                 self._print("[charger] Already charging. Use 'charge stop' first.",
                             async_msg=False)
                 return False
-
-            charge_current = current if current is not None else self.cfg["charge_current"]
-            target_voltage = self.cfg["target_voltage"]
-
-            if charge_current > PSU_I_MAX:
-                self._print("[charger] ERROR: Current {:.1f}A exceeds PSU max {:.1f}A".format(
-                    charge_current, PSU_I_MAX), async_msg=False)
-                return False
-            if target_voltage > PSU_V_MAX:
-                self._print("[charger] ERROR: Target {:.2f}V exceeds PSU max {:.1f}V".format(
-                    target_voltage, PSU_V_MAX), async_msg=False)
-                return False
-
-            self.state                = ChargerState()
-            self.state.phase          = ChargePhase.DETECT
-            self.state.start_time     = None   # timer starts at RAMP entry
-            self.state.charge_current = charge_current
-            self.state.active_psus    = list(psu_ids)
-            self.state.last_status_t  = time.time()
+            self._run_seq += 1
+            st                = ChargerState()
+            st.run_id         = self._run_seq
+            st.phase          = ChargePhase.DETECT
+            st.start_time     = None   # timer starts at RAMP entry
+            st.charge_current = charge_current
+            st.active_psus    = list(psu_ids)
+            st.last_status_t  = time.time()
+            self.state        = st
+            run_id            = st.run_id
 
         detect_v = self.cfg["detect_voltage"]
         detect_i = self.cfg["detect_current"]
@@ -1705,20 +2001,55 @@ class Charger:
         log.info("Charger DETECT: psus={} V={:.2f} I={:.2f} threshold={:.2f}V".format(
             psu_ids, detect_v, detect_i, detect_v + self.cfg["detect_threshold"]))
 
-        threading.Thread(target=self._detect_ramp_loop, daemon=True,
+        threading.Thread(target=self._detect_ramp_loop, args=(run_id,), daemon=True,
                         name="charger-detect").start()
         return True
 
-    def _detect_ramp_loop(self):
+    def _return_to_detect(self, reason):
+        """
+        Battery lost during CC/CV: return to DETECT phase and wait for the
+        battery to come back. Ah/Wh counters are intentionally preserved -
+        they are cleared only by 'charge reset'.
+        Must be called with self._lock held (from on_status).
+        """
+        log.warning("Charger: {}".format(reason))
+        self.state.phase             = ChargePhase.DETECT
+        self.state.ramp_voltage      = None
+        self.state.start_time        = None
+        self.state.low_current_since = None
+        self.state.prev_total_iout   = None
+        self.state.cv_entry_current  = None
+        self.state.last_status_t     = time.time()
+        ok = self.bus.cmd_set(self.cfg["detect_voltage"], self.cfg["detect_current"])
+        if not ok:
+            self.state.phase       = ChargePhase.ERROR
+            self.state.stop_reason = "CAN send failed on battery disconnect"
+            return
+        self._print("[charger] {} - returning to DETECT".format(reason), async_msg=True)
+        # The old detect/ramp thread already exited when the phase reached
+        # CC/CV, so a fresh one is needed to run the DETECT loop again.
+        threading.Thread(target=self._detect_ramp_loop, args=(self.state.run_id,),
+                         daemon=True, name="charger-detect").start()
+
+    def _detect_ramp_loop(self, my_run):
         """
         DETECT phase: PSU holds detect_voltage / detect_current.
         When vout > detect_voltage + detect_threshold, battery is present
-        and vout approximates V_bat. Transition to RAMP.
+        and vout approximates V_bat (also estimates SOC from OCV here).
+        Transition to RAMP.
 
-        RAMP phase: voltage steps up by ramp_step_voltage every ramp_step_interval seconds,
-        starting from V_bat. Transitions to CC when iout >= charge_current,
-        or directly to CV when ramp_voltage >= target_voltage.
-        If battery disconnects (vout drops back below detect threshold), return to DETECT.
+        RAMP phase: voltage steps up by ramp_step_voltage every ramp_step_interval
+        seconds, starting from V_bat. Transitions to CC when iout >= charge_current
+        (and then sends the final target voltage), or directly to CV when
+        ramp_voltage >= target_voltage.
+        If battery disconnects (vout drops back below detect threshold),
+        return to DETECT (outer loop).
+
+        my_run: generation counter captured at thread start. The thread exits
+        as soon as self.state.run_id differs (charger was reset/restarted),
+        so two loops can never drive the PSU at the same time.
+        The charge current is re-read from state on every iteration so
+        'charge current <A>' takes effect immediately.
         """
         detect_v   = self.cfg["detect_voltage"]
         detect_i   = self.cfg["detect_current"]
@@ -1726,7 +2057,6 @@ class Charger:
         step_v     = self.cfg["ramp_step_voltage"]
         step_int   = self.cfg["ramp_step_interval"]
         target_v   = self.cfg["target_voltage"]
-        charge_i   = self.state.charge_current
 
         def _get_psu():
             """Return first active PSU object or None."""
@@ -1736,150 +2066,216 @@ class Charger:
                     return self.bus.psus[shex]
             return None
 
-        # ----------------------------------------------------------------
-        # DETECT loop
-        # ----------------------------------------------------------------
         while True:
-            time.sleep(step_int)
-            with self._lock:
-                if self.state.phase != ChargePhase.DETECT:
-                    return   # user stopped
-
-            psu = _get_psu()
-            if psu is None:
-                continue
-
-            vout = psu.vout
-            iout = psu.iout
-            # Battery detected by voltage rise (battery above detect_v)
-            # OR by current draw (battery below detect_v but accepting charge)
-            if vout > detect_v + threshold or iout >= self.cfg["min_current_detect"]:
-                v_bat     = vout
-                ramp_start = max(round(v_bat - 3 * step_v, 3), detect_v)
-                self._print("[charger] Battery detected (Vout={:.2f}V Iout={:.2f}A) "
-                           "- starting RAMP from {:.2f}V".format(
-                           vout, iout, ramp_start), async_msg=True)
-                log.info("Charger: battery detected Vout={:.2f}V Iout={:.2f}A "
-                        "ramp_start={:.2f}V".format(vout, iout, ramp_start))
+            # ----------------------------------------------------------------
+            # DETECT loop
+            # ----------------------------------------------------------------
+            while True:
+                time.sleep(step_int)
                 with self._lock:
-                    self.state.phase        = ChargePhase.RAMP
-                    self.state.ramp_voltage = ramp_start
-                    # start_time marks beginning of RAMP (safety timer counts from here)
-                    self.state.start_time   = time.time()
-                    self.state.last_status_t = time.time()
-                # Apply initial ramp voltage immediately
-                self.bus.cmd_set(ramp_start, charge_i)
-                break
-            else:
-                log.debug("Charger DETECT: Vout={:.2f}V Iout={:.2f}A - no battery".format(
-                    vout, iout))
+                    if self.state.run_id != my_run:
+                        return   # superseded by reset / new start
+                    if self.state.phase != ChargePhase.DETECT:
+                        return   # user stopped / error
 
-        # ----------------------------------------------------------------
-        # RAMP loop
-        # ----------------------------------------------------------------
-        while True:
-            time.sleep(step_int)
-            with self._lock:
-                if self.state.phase != ChargePhase.RAMP:
-                    return   # transitioned out (user stop / error)
+                psu = _get_psu()
+                if psu is None:
+                    continue
 
-            psu = _get_psu()
-            if psu is None:
-                continue
+                vout = psu.vout
+                iout = psu.iout
+                # Battery detected by voltage rise (battery above detect_v)
+                # OR by current draw (battery below detect_v but accepting charge)
+                if vout > detect_v + threshold or iout >= self.cfg["min_current_detect"]:
+                    ramp_start = max(round(vout - 3 * step_v, 3), detect_v)
+                    # Current is near zero here, so vout ~ OCV -> SOC anchor
+                    soc0 = self._soc_from_ocv(vout / self.cfg["cell_count"])
+                    with self._lock:
+                        if self.state.run_id != my_run:
+                            return
+                        charge_i = self.state.charge_current
+                        self.state.phase         = ChargePhase.RAMP
+                        self.state.ramp_voltage  = ramp_start
+                        # start_time marks beginning of RAMP (safety timer counts from here)
+                        self.state.start_time    = time.time()
+                        self.state.last_status_t = time.time()
+                        self.state.soc_start     = soc0
+                        self.state.soc_ah_base   = self.state.ah
+                    self._print("[charger] Battery detected (Vout={:.2f}V Iout={:.2f}A, "
+                               "SOC ~{:.0f}%) - starting RAMP from {:.2f}V".format(
+                               vout, iout, soc0, ramp_start), async_msg=True)
+                    log.info("Charger: battery detected Vout={:.2f}V Iout={:.2f}A "
+                            "SOC~{:.0f}% ramp_start={:.2f}V".format(
+                            vout, iout, soc0, ramp_start))
+                    # Apply initial ramp voltage immediately
+                    self.bus.cmd_set(ramp_start, charge_i)
+                    break
+                else:
+                    log.debug("Charger DETECT: Vout={:.2f}V Iout={:.2f}A - no battery".format(
+                        vout, iout))
 
-            vout  = psu.vout
-            iout  = psu.iout
-            ramp_v = self.state.ramp_voltage
-
-            # Battery disconnect detection: vout dropped back near detect level
-            if vout < detect_v + threshold - 0.5:
-                self._print("[charger] Battery disconnected during RAMP "
-                           "(Vout={:.2f}V) - returning to DETECT".format(vout), async_msg=True)
-                log.warning("Charger RAMP: battery disconnect Vout={:.2f}V".format(vout))
+            # ----------------------------------------------------------------
+            # RAMP loop
+            # ----------------------------------------------------------------
+            back_to_detect = False
+            while True:
+                time.sleep(step_int)
                 with self._lock:
-                    self.state.phase        = ChargePhase.DETECT
-                    self.state.ramp_voltage = None
-                    self.state.start_time   = None
-                    self.state.ah           = 0.0
-                    self.state.wh           = 0.0
-                    self.state.last_status_t = time.time()
-                ok = self.bus.cmd_set(detect_v, detect_i)
+                    if self.state.run_id != my_run:
+                        return
+                    if self.state.phase != ChargePhase.RAMP:
+                        return   # transitioned out (user stop / error)
+                    charge_i = self.state.charge_current   # may change at runtime
+                    ramp_v   = self.state.ramp_voltage
+
+                psu = _get_psu()
+                if psu is None:
+                    continue
+
+                vout = psu.vout
+                iout = psu.iout
+
+                # Battery disconnect detection: vout dropped back near detect level
+                if vout < detect_v + threshold - 0.5:
+                    self._print("[charger] Battery disconnected during RAMP "
+                               "(Vout={:.2f}V) - returning to DETECT".format(vout), async_msg=True)
+                    log.warning("Charger RAMP: battery disconnect Vout={:.2f}V".format(vout))
+                    with self._lock:
+                        if self.state.run_id != my_run:
+                            return
+                        self.state.phase         = ChargePhase.DETECT
+                        self.state.ramp_voltage  = None
+                        self.state.start_time    = None
+                        self.state.last_status_t = time.time()
+                        # Ah/Wh intentionally preserved - cleared only by 'charge reset'
+                    ok = self.bus.cmd_set(detect_v, detect_i)
+                    if not ok:
+                        with self._lock:
+                            self.state.phase       = ChargePhase.ERROR
+                            self.state.stop_reason = "CAN send failed on battery disconnect"
+                        return
+                    back_to_detect = True
+                    break
+
+                # CC transition: iout reached the charge current -> the PSU is
+                # entering current limit. Do NOT jump the setpoint to the final
+                # target voltage in one step: a multi-volt step into a large
+                # battery makes the PSU's current limiter overshoot hard
+                # (measured on real HW: 42.6A transient on a 41.7A/2000W unit,
+                # ~2.3kW -> overload -> protective shutdown ~47s later).
+                # Instead switch to CC and keep stepping the setpoint by
+                # ramp_step_voltage every ramp_step_interval up to target_v;
+                # the PSU stays in current limit and each small step is
+                # absorbed without overshoot.
+                if iout >= charge_i * 0.95:
+                    self._print("[charger] RAMP -> CC (Iout={:.1f}A at Vramp={:.2f}V) "
+                                "- setpoint continues ramping to {:.2f}V".format(
+                                    iout, ramp_v, target_v), async_msg=True)
+                    log.info("Charger RAMP->CC: Iout={:.1f}A Vramp={:.2f}V "
+                             "(setpoint ramp to {:.2f}V continues)".format(
+                                 iout, ramp_v, target_v))
+                    with self._lock:
+                        if self.state.run_id != my_run:
+                            return
+                        self.state.phase             = ChargePhase.CC
+                        # ramp_voltage intentionally KEPT - it tracks the
+                        # setpoint which continues stepping toward target_v
+                        self.state.low_current_since = None
+                    self._cc_setpoint_ramp(my_run)
+                    return
+
+                # Advance ramp voltage
+                new_v = round(ramp_v + step_v, 3)
+                if new_v >= target_v:
+                    new_v = target_v
+
+                with self._lock:
+                    if self.state.run_id != my_run:
+                        return
+                    self.state.ramp_voltage = new_v
+
+                ok = self.bus.cmd_set(new_v, charge_i)
                 if not ok:
                     with self._lock:
-                        self.state.phase      = ChargePhase.ERROR
-                        self.state.stop_reason = "CAN send failed on battery disconnect"
+                        self.state.phase       = ChargePhase.ERROR
+                        self.state.stop_reason = "CAN send failed during RAMP"
                     return
-                # re-enter DETECT loop
-                while True:
-                    time.sleep(step_int)
+
+                log.debug("Charger RAMP: V={:.2f}V Vout={:.2f}V Iout={:.1f}A".format(
+                    new_v, vout, iout))
+
+                # Reached target voltage -> skip CC, go straight to CV
+                if new_v >= target_v:
+                    self._print("[charger] RAMP -> CV (target {:.2f}V reached, "
+                               "Iout={:.1f}A)".format(target_v, iout), async_msg=True)
+                    log.info("Charger RAMP->CV: target reached Iout={:.1f}A".format(iout))
                     with self._lock:
-                        if self.state.phase != ChargePhase.DETECT:
+                        if self.state.run_id != my_run:
                             return
-                    psu2 = _get_psu()
-                    if psu2 is None:
-                        continue
-                    vout2 = psu2.vout
-                    iout2 = psu2.iout
-                    if vout2 > detect_v + threshold or iout2 >= self.cfg["min_current_detect"]:
-                        v_bat2      = vout2
-                        ramp_start2 = max(round(v_bat2 - 3 * step_v, 3), detect_v)
-                        self._print("[charger] Battery re-detected (Vout={:.2f}V Iout={:.2f}A) "
-                                   "- starting RAMP from {:.2f}V".format(
-                                   vout2, iout2, ramp_start2), async_msg=True)
-                        log.info("Charger: battery re-detected Vout={:.2f}V "
-                                "ramp_start={:.2f}V".format(vout2, ramp_start2))
-                        with self._lock:
-                            self.state.phase        = ChargePhase.RAMP
-                            self.state.ramp_voltage = ramp_start2
-                            self.state.start_time   = time.time()
-                            self.state.last_status_t = time.time()
-                        self.bus.cmd_set(ramp_start2, charge_i)
-                        ramp_v = ramp_start2
-                        break
-                    else:
-                        log.debug("Charger DETECT: Vout={:.2f}V Iout={:.2f}A - no battery".format(
-                            vout2, iout2))
-                continue
+                        self.state.phase            = ChargePhase.CV
+                        self.state.ramp_voltage     = None
+                        self.state.cv_entry_current = iout
+                        self.state.prev_total_iout  = None
+                    if self.bus.webgui is not None:
+                        self.bus.webgui.mark_cc_to_cv()
+                    return
 
-            # CC transition: iout already at charge current → PSU entered CC on its own
-            if iout >= charge_i * 0.95:
-                self._print("[charger] RAMP -> CC (Iout={:.1f}A at Vramp={:.2f}V)".format(
-                    iout, ramp_v), async_msg=True)
-                log.info("Charger RAMP->CC: Iout={:.1f}A Vramp={:.2f}V".format(iout, ramp_v))
-                with self._lock:
-                    self.state.phase        = ChargePhase.CC
-                    self.state.ramp_voltage = None
-                return
+            if back_to_detect:
+                continue   # re-enter DETECT loop
 
-            # Advance ramp voltage
-            new_v = round(ramp_v + step_v, 3)
-            if new_v >= target_v:
-                new_v = target_v
+    def _cc_setpoint_ramp(self, my_run):
+        """
+        Continuation of the setpoint ramp AFTER the RAMP->CC transition.
 
+        The PSU is in current limit, so the output current is defined by the
+        current setpoint - stepping the VOLTAGE setpoint gently toward
+        target_voltage does not change the delivered current, but it must
+        eventually reach target_voltage or the CC->CV condition
+        (vout >= target - tol) could never be met (the 3.0.0 stall bug).
+        Doing it in ramp_step_voltage increments avoids the current-limiter
+        overshoot that a single multi-volt jump provokes (the 3.0.0..3.0.1
+        overload bug).
+
+        Runs in the detect/ramp thread. Exits when:
+          - the setpoint reaches target_voltage (normal CC continues,
+            CC->CV handled by on_status),
+          - the phase leaves CC (CV transition, battery disconnect ->
+            _return_to_detect spawns a fresh detect thread, stop, error),
+          - the charger is reset/restarted (run_id mismatch).
+        The charge current is re-read every step so 'charge current <A>'
+        keeps taking effect immediately.
+        """
+        step_v   = self.cfg["ramp_step_voltage"]
+        step_int = self.cfg["ramp_step_interval"]
+        target_v = self.cfg["target_voltage"]
+
+        while True:
             with self._lock:
-                self.state.ramp_voltage = new_v
+                if self.state.run_id != my_run:
+                    return
+                if self.state.phase != ChargePhase.CC:
+                    return
+                ramp_v   = self.state.ramp_voltage
+                charge_i = self.state.charge_current
+            if ramp_v is None or ramp_v >= target_v:
+                return   # setpoint at target - plain CC from here on
 
+            new_v = min(round(ramp_v + step_v, 3), target_v)
             ok = self.bus.cmd_set(new_v, charge_i)
             if not ok:
                 with self._lock:
-                    self.state.phase      = ChargePhase.ERROR
-                    self.state.stop_reason = "CAN send failed during RAMP"
+                    if self.state.run_id == my_run:
+                        self.state.phase       = ChargePhase.ERROR
+                        self.state.stop_reason = "CAN send failed during CC setpoint ramp"
                 return
-
-            log.debug("Charger RAMP: V={:.2f}V Vout={:.2f}V Iout={:.1f}A".format(
-                new_v, vout, iout))
-
-            # Reached target voltage → skip CC, go straight to CV
-            if new_v >= target_v:
-                self._print("[charger] RAMP -> CV (target {:.2f}V reached, "
-                           "Iout={:.1f}A)".format(target_v, iout), async_msg=True)
-                log.info("Charger RAMP->CV: target reached Iout={:.1f}A".format(iout))
-                with self._lock:
-                    self.state.phase        = ChargePhase.CV
-                    self.state.ramp_voltage = None
-                if self.bus.webgui is not None:
-                    self.bus.webgui.mark_cc_to_cv()
-                return
+            with self._lock:
+                if self.state.run_id != my_run:
+                    return
+                if self.state.phase == ChargePhase.CC:
+                    self.state.ramp_voltage = new_v
+            log.debug("Charger CC setpoint ramp: V={:.2f}V (target {:.2f}V)".format(
+                new_v, target_v))
+            time.sleep(step_int)
 
     def stop(self, reason="User stop"):
         """Stop charging - set current to 0."""
@@ -1892,8 +2288,9 @@ class Charger:
         """Called from on_status (already locked)."""
         self._do_stop(reason, error=error)
         if error:
-            self._print("[charger] ERROR: {}".format(reason), async_msg=True)
-            log.error("Charge stopped: {}".format(reason))
+            # Error stops go to the terminal status bar (top row) instead of
+            # interleaving with the CLI prompt; notify() also logs.
+            self.bus.notify("Charger: {}".format(reason), "error")
         else:
             self._print("[charger] {}".format(reason), async_msg=True)
             log.info("Charge finished: {}".format(reason))
@@ -1949,6 +2346,9 @@ class Charger:
                 total_i += psu.iout
         if len(s.active_psus) > 1:
             lines.append("Total I   : {:.1f} A".format(total_i))
+        soc = self.estimate_soc(total_i if s.active_psus else None)
+        if soc is not None:
+            lines.append("SOC est.  : ~{:.0f} %  (OCV anchor + coulomb count)".format(soc))
         if s.stop_reason:
             lines.append("Stop reason: {}".format(s.stop_reason))
         return lines
@@ -1977,6 +2377,8 @@ Commands:
 Charger commands (LiFePO4 CC/CV):
   charge start [I]   Start charging (optional current override in A)
   charge stop        Stop charging (sets current to 0)
+  charge current <I> Change charge current while charging (A)
+  charge reset       Reset: clear Ah/Wh, default current, restart from DETECT
   charge status      Show current charge status
   charge monitor     Continuous status monitor (Enter to stop)
   charge config      Show charger configuration
@@ -1995,6 +2397,8 @@ Examples:
   standby 1
   charge start
   charge start 15.0
+  charge current 20.0
+  charge reset
   charge status
   charge battery
   charge monitor
@@ -2089,6 +2493,22 @@ def run_cli(bus, terminal=None):
                         charger.state.ah, charger.state.wh,
                         charger.state.elapsed_str))
 
+            elif subcmd == "current":
+                # charge current <amps> - change charge current while charging
+                if len(parts) < 3:
+                    out("[charger] Usage: charge current <amps>")
+                    continue
+                try:
+                    amps = float(parts[2])
+                except ValueError:
+                    out("[charger] ERROR: invalid current '{}'".format(parts[2]))
+                    continue
+                charger.set_current(amps)
+
+            elif subcmd == "reset":
+                # clear Ah/Wh, restore config current, restart from DETECT
+                charger.reset()
+
             elif subcmd == "status":
                 lines = charger.get_status_lines()
                 out("")
@@ -2167,7 +2587,7 @@ def run_cli(bus, terminal=None):
                 out("")
 
             else:
-                out("[charger] Unknown subcommand '{}'. Use: start / stop / status / monitor / config / battery".format(subcmd))
+                out("[charger] Unknown subcommand '{}'. Use: start / stop / current / reset / status / monitor / config / battery".format(subcmd))
 
         elif cmd == "standby":
             if len(parts) >= 2:
@@ -2313,14 +2733,35 @@ def daemonize(pidfile, user=None, group=None):
 HISTORY_MAXLEN = 4320
 
 class DataHistory:
-    """Thread-safe ring buffer for time-series data."""
-    def __init__(self, maxlen=HISTORY_MAXLEN):
+    """
+    Thread-safe ring buffer for time-series data.
+    With persist_file set, samples are also appended to a CSV file (buffered,
+    flushed every flush_interval seconds to spare SD/flash media). On startup
+    the last 12 h are loaded back into RAM so graphs survive a restart, and
+    rows older than retention_days are dropped from the file.
+    """
+
+    CSV_HEADER = "timestamp_ms,vout,iout,ah,wh"
+
+    def __init__(self, maxlen=HISTORY_MAXLEN, persist_file=None,
+                 flush_interval=60.0, retention_days=30.0):
         self._lock = threading.Lock()
         self._ts   = collections.deque(maxlen=maxlen)
         self._vout = collections.deque(maxlen=maxlen)
         self._iout = collections.deque(maxlen=maxlen)
         self._ah   = collections.deque(maxlen=maxlen)
         self._wh   = collections.deque(maxlen=maxlen)
+
+        self._persist_file   = persist_file
+        self._flush_interval = max(flush_interval, 1.0)
+        self._retention_days = retention_days
+        self._pending        = []                  # rows waiting for flush
+        self._flush_stop     = threading.Event()
+
+        if self._persist_file:
+            self._load_and_trim()
+            threading.Thread(target=self._flush_loop, daemon=True,
+                             name="history-flush").start()
 
     def append(self, vout, iout, ah, wh):
         ts = time.time() * 1000  # ms epoch for JS
@@ -2330,6 +2771,91 @@ class DataHistory:
             self._iout.append(round(iout, 2))
             self._ah.append(round(ah, 3))
             self._wh.append(round(wh, 3))
+            if self._persist_file:
+                self._pending.append("{:.0f},{},{},{},{}".format(
+                    ts, round(vout, 2), round(iout, 2),
+                    round(ah, 3), round(wh, 3)))
+
+    # ------------------------------------------------------------------
+    # CSV persistence
+    # ------------------------------------------------------------------
+
+    def _load_and_trim(self):
+        """Load last 12h back into RAM; rewrite the file keeping only rows
+        newer than retention_days (atomic replace via temp file)."""
+        path        = self._persist_file
+        cutoff_ram  = (time.time() - HISTORY_MAXLEN * 10) * 1000   # ~12 h
+        cutoff_file = (time.time() - self._retention_days * 86400) * 1000
+        keep, loaded = [], 0
+        try:
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("timestamp"):
+                            continue
+                        parts = line.split(",")
+                        # Validate the WHOLE row before using it anywhere -
+                        # a truncated row (e.g. power loss during flush) must
+                        # neither desync the RAM deques nor survive the file
+                        # rewrite below.
+                        try:
+                            ts   = float(parts[0])
+                            vout = float(parts[1])
+                            iout = float(parts[2])
+                            ah   = float(parts[3])
+                            wh   = float(parts[4])
+                        except (ValueError, IndexError):
+                            continue
+                        if ts < cutoff_file:
+                            continue
+                        keep.append(line)
+                        if ts >= cutoff_ram:
+                            self._ts.append(ts)
+                            self._vout.append(vout)
+                            self._iout.append(iout)
+                            self._ah.append(ah)
+                            self._wh.append(wh)
+                            loaded += 1
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(self.CSV_HEADER + "\n")
+                if keep:
+                    f.write("\n".join(keep) + "\n")
+            os.replace(tmp, path)
+            log.info("History: {} points loaded into RAM, {} rows retained "
+                     "in {}".format(loaded, len(keep), path))
+        except OSError as e:
+            log.warning("History: cannot load/trim {}: {} - persistence "
+                        "continues with append only".format(path, e))
+
+    def _flush_loop(self):
+        while not self._flush_stop.wait(self._flush_interval):
+            self.flush()
+
+    def flush(self):
+        """Write buffered rows to the CSV file. Called periodically by the
+        flush thread and once more on shutdown (close())."""
+        if not self._persist_file:
+            return
+        with self._lock:
+            if not self._pending:
+                return
+            rows, self._pending = self._pending, []
+        try:
+            write_header = not os.path.exists(self._persist_file)
+            with open(self._persist_file, "a") as f:
+                if write_header:
+                    f.write(self.CSV_HEADER + "\n")
+                f.write("\n".join(rows) + "\n")
+        except OSError as e:
+            log.warning("History: flush to {} failed: {}".format(
+                self._persist_file, e))
+
+    def close(self):
+        """Stop flush thread and write any remaining buffered rows."""
+        self._flush_stop.set()
+        self.flush()
 
     def get(self, window_s=None):
         """Return dict of lists. window_s: None = all, else last N seconds."""
@@ -2383,10 +2909,12 @@ _DASHBOARD_HTML = """\
 }
 *{box-sizing:border-box;margin:0;padding:0;}
 body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh;}
-header{background:var(--surface);border-bottom:1px solid var(--border);padding:12px 16px;
-       display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:10;}
+header{background:var(--surface);border-bottom:1px solid var(--border);padding:10px 16px;
+       display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:10;flex-wrap:wrap;}
 header h1{font-size:1.1rem;font-weight:600;color:var(--accent);}
 header .version{font-size:.75rem;color:var(--text2);margin-left:auto;}
+#hdr-live{font-size:.82rem;font-weight:600;color:var(--accent2);
+          font-variant-numeric:tabular-nums;white-space:nowrap;}
 #can-status{font-size:.78rem;padding:3px 8px;border-radius:20px;font-weight:600;}
 #can-status.ok {background:#1b5e20;color:#a5d6a7;}
 #can-status.err{background:#b71c1c;color:#ffcdd2;}
@@ -2464,6 +2992,7 @@ input[type=number]:focus{outline:none;border-color:var(--accent);}
   <h1>Flatpack2 Dashboard</h1>
   <span id="can-status" class="ok">CAN OK</span>
   <span id="mode-badge">Zdroj</span>
+  <span id="hdr-live">--</span>
   <span class="version">v__VERSION__</span>
 </header>
 
@@ -2488,11 +3017,11 @@ input[type=number]:focus{outline:none;border-color:var(--accent);}
     <form id="set-form">
       <div class="form-row"><label>Voltage V</label><input type="number" id="f-voltage" step="0.1" min="__V_MIN__" max="__V_MAX__" placeholder="54.0"></div>
       <div class="form-row"><label>Current A</label><input type="number" id="f-current" step="0.1" min="0.1" max="__I_MAX__" placeholder="20.0"></div>
-      <div class="btn-row">
+      <div class="btn-row" style="align-items:center;">
         <button type="submit" class="btn btn-primary">Set</button>
         <button type="button" class="btn btn-standby" onclick="doStandby()">&#9711; Standby</button>
+        <span style="font-size:.75rem;color:var(--text2);">__STANDBY_V__&nbsp;V&nbsp;/&nbsp;__STANDBY_I__&nbsp;A</span>
       </div>
-      <div style="font-size:.75rem;color:var(--text2);margin-top:4px;">Standby: __STANDBY_V__&nbsp;V&nbsp;/&nbsp;__STANDBY_I__&nbsp;A</div>
     </form>
     <div id="set-result" class="result-msg"></div>
   </div>
@@ -2506,12 +3035,21 @@ input[type=number]:focus{outline:none;border-color:var(--accent);}
     <div class="stat-row"><span class="stat-label">Actual I</span><span class="stat-value" id="ch-actual-i">--</span></div>
     <div class="stat-row"><span class="stat-label">Charged Ah</span><span class="stat-value" id="ch-ah">--</span></div>
     <div class="stat-row"><span class="stat-label">Charged Wh</span><span class="stat-value" id="ch-wh">--</span></div>
+    <div class="stat-row"><span class="stat-label">Set I</span><span class="stat-value" id="ch-set-i">--</span></div>
     <div class="stat-row"><span class="stat-label">Target V</span><span class="stat-value" id="ch-target">--</span></div>
     <div class="stat-row"><span class="stat-label">Tail I</span><span class="stat-value" id="ch-tail">--</span></div>
+    <div class="stat-row"><span class="stat-label">SOC est.</span><span class="stat-value" id="ch-soc">--</span></div>
+    <div class="stat-row" id="ch-stop-row" style="display:none"><span class="stat-label">Stop reason</span><span class="stat-value" id="ch-stop" style="font-size:.78rem;text-align:right;">--</span></div>
     <div class="phase-bar-bg"><div class="phase-bar" id="ch-bar" style="width:0%"></div></div>
+    <div class="form-row" style="margin-top:8px;">
+      <label>Current A</label>
+      <input type="number" id="ch-f-current" step="0.1" min="0.1" max="__I_MAX__" placeholder="35.0">
+      <button type="button" class="btn btn-primary" onclick="chargeSetCurrent()">Set&nbsp;I</button>
+    </div>
     <div class="btn-row" style="margin-top:8px;">
       <button class="btn btn-green" onclick="chargeStart()">&#9654; Start</button>
       <button class="btn btn-red"   onclick="chargeStop()">&#9646;&#9646; Stop</button>
+      <button class="btn btn-standby" onclick="chargeReset()">&#8635; Reset</button>
     </div>
     <div id="ch-result" class="result-msg"></div>
   </div>
@@ -2755,8 +3293,21 @@ function handleData(d) {
     }
   }
 
-  // PSU
+  // Header live values: V / I always, + Ah / Wh in charger mode
   const psu = d.psu;
+  const hdrLive = document.getElementById('hdr-live');
+  if (hdrLive) {
+    let txt = '';
+    if (psu && psu.vout != null && psu.iout != null)
+      txt = psu.vout.toFixed(2)+' V \u00b7 '+psu.iout.toFixed(1)+' A';
+    if (d.system && d.system.charger_configured && d.charger &&
+        d.charger.ah != null && d.charger.wh != null)
+      txt += (txt ? ' \u00b7 ' : '') +
+             d.charger.ah.toFixed(1)+' Ah \u00b7 '+d.charger.wh.toFixed(0)+' Wh';
+    hdrLive.textContent = txt || '--';
+  }
+
+  // PSU
   if (psu) {
     setText('vout',     psu.vout  != null ? psu.vout.toFixed(2)+' V'  : '--');
     setText('iout',     psu.iout  != null ? psu.iout.toFixed(1)+' A'  : '--');
@@ -2797,8 +3348,20 @@ function handleData(d) {
     setText('ch-wh',     ch.wh   != null ? ch.wh.toFixed(3)+' Wh' : '--');
     setText('ch-target', ch.target_v != null ? ch.target_v.toFixed(2)+' V' : '--');
     setText('ch-tail',   ch.tail_i   != null ? ch.tail_i.toFixed(1)+' A'   : '--');
+    setText('ch-set-i',  ch.charge_current != null ? ch.charge_current.toFixed(1)+' A' : '--');
+    setText('ch-soc',    ch.soc != null ? '~'+ch.soc.toFixed(0)+' % (estimate)' : '--');
+    const stopRow = document.getElementById('ch-stop-row');
+    if (ch.stop_reason) {
+      stopRow.style.display = '';
+      setText('ch-stop', ch.stop_reason);
+    } else {
+      stopRow.style.display = 'none';
+    }
+    // Progress bar: SOC estimate when available, fallback to phase heuristic
     let pct = 0;
-    if (ch.phase === 'CV' || ch.phase === 'done') pct = 100;
+    if (ch.phase === 'done') pct = 100;
+    else if (ch.soc != null) pct = Math.min(100, Math.round(ch.soc));
+    else if (ch.phase === 'CV') pct = 99;
     else if (ch.phase === 'CC' && ch.target_v && psu && psu.vout)
       pct = Math.min(99, Math.round(psu.vout / ch.target_v * 100));
     else if (ch.phase === 'ramp' && ch.ramp_v && ch.target_v)
@@ -2877,6 +3440,18 @@ async function chargeStop() {
   const r = await apiPost('/api/charge/stop', {});
   showResult('ch-result', r.message||(r.ok?'Stopped':'Error'), r.ok);
 }
+async function chargeSetCurrent() {
+  const i = parseFloat(document.getElementById('ch-f-current').value);
+  if (isNaN(i)) { showResult('ch-result','Enter a valid current',false); return; }
+  if (!confirm(`Change charge current to ${i.toFixed(1)} A?`)) return;
+  const r = await apiPost('/api/charge/current', {current:i});
+  showResult('ch-result', r.message||(r.ok?'OK':'Error'), r.ok);
+}
+async function chargeReset() {
+  if (!confirm('Reset charger?\\nAh/Wh counters will be cleared, charge current restored to the config default and charging restarts from the DETECT phase.')) return;
+  const r = await apiPost('/api/charge/reset', {});
+  showResult('ch-result', r.message||(r.ok?'Reset done':'Error'), r.ok);
+}
 async function doStandby() {
   if (!confirm('Set PSU to Standby (__STANDBY_V__ V / __STANDBY_I__ A)?')) return;
   const r = await apiPost('/api/standby', {});
@@ -2909,8 +3484,6 @@ class WebGUI:
     Runs in a dedicated daemon thread alongside CLI and CAN loops.
     """
 
-    SSE_INTERVAL = 10.0
-
     def __init__(self, bus, cfg, history):
         self.bus         = bus
         self.cfg         = cfg
@@ -2919,9 +3492,11 @@ class WebGUI:
         self._log_buf    = collections.deque(maxlen=200)
         self._cc_to_cv_ts = None
 
-        self.host       = cfg.get("webgui", "host")
-        self.port       = cfg.getint("webgui", "port")
-        self.log_access = cfg.getboolean("webgui", "log_access")
+        self.host         = cfg.get("webgui", "host")
+        self.port         = cfg.getint("webgui", "port")
+        self.log_access   = cfg.getboolean("webgui", "log_access")
+        self.sse_interval = max(cfg.getfloat("webgui", "sse_interval",
+                                             fallback=3.0), 1.0)
 
         self.app = Flask(__name__)
         self.app.logger.disabled = True
@@ -2978,7 +3553,7 @@ class WebGUI:
                 while True:
                     data = self._build_payload()
                     yield "data: {}\n\n".format(_json.dumps(data))
-                    time.sleep(self.SSE_INTERVAL)
+                    time.sleep(self.sse_interval)
 
             return Response(generate(), mimetype="text/event-stream",
                             headers={"Cache-Control": "no-cache",
@@ -3043,6 +3618,38 @@ class WebGUI:
                 log.debug("[webgui] POST /api/charge/stop 200")
             return jsonify({"ok": True, "message": "Charging stopped"})
 
+        @app.route("/api/charge/current", methods=["POST"])
+        def api_charge_current():
+            if self.bus.charger is None:
+                return jsonify({"ok": False, "message": "Charger not configured"}), 400
+            data = request.get_json(force=True) or {}
+            try:
+                amps = float(data["current"])
+            except (KeyError, ValueError, TypeError):
+                if self.log_access:
+                    log.debug("[webgui] POST /api/charge/current 400")
+                return jsonify({"ok": False,
+                                "message": "Missing or invalid current"}), 400
+            ok = self.bus.charger.set_current(amps)
+            if self.log_access:
+                log.debug("[webgui] POST /api/charge/current {}".format(
+                    200 if ok else 400))
+            msg = ("Charge current set to {:.1f} A".format(amps)
+                   if ok else "Change failed (not charging or out of range)")
+            return jsonify({"ok": ok, "message": msg}), (200 if ok else 400)
+
+        @app.route("/api/charge/reset", methods=["POST"])
+        def api_charge_reset():
+            if self.bus.charger is None:
+                return jsonify({"ok": False, "message": "Charger not configured"}), 400
+            ok = self.bus.charger.reset()
+            if self.log_access:
+                log.debug("[webgui] POST /api/charge/reset {}".format(
+                    200 if ok else 400))
+            msg = ("Charger reset - Ah/Wh cleared, restarting from DETECT"
+                   if ok else "Reset failed")
+            return jsonify({"ok": ok, "message": msg}), (200 if ok else 400)
+
         @app.route("/api/history")
         def api_history():
             window   = request.args.get("window")
@@ -3082,14 +3689,24 @@ class WebGUI:
         ch_data = None
         if bus.charger:
             cs = bus.charger.state
+            total_iout = 0.0
+            for pid in cs.active_psus:
+                shex2 = bus._id_map.get(pid)
+                p2    = bus.psus.get(shex2) if shex2 else None
+                if p2:
+                    total_iout += p2.iout
+            soc = bus.charger.estimate_soc(total_iout if cs.active_psus else None)
             ch_data = {
-                "phase":    cs.phase,
-                "elapsed":  cs.elapsed_str,
-                "ah":       round(cs.ah, 3),
-                "wh":       round(cs.wh, 3),
-                "target_v": bus.charger.cfg["target_voltage"],
-                "tail_i":   bus.charger.cfg["charge_current_tail"],
-                "ramp_v":   cs.ramp_voltage,
+                "phase":          cs.phase,
+                "elapsed":        cs.elapsed_str,
+                "ah":             round(cs.ah, 3),
+                "wh":             round(cs.wh, 3),
+                "target_v":       bus.charger.cfg["target_voltage"],
+                "tail_i":         bus.charger.cfg["charge_current_tail"],
+                "ramp_v":         cs.ramp_voltage,
+                "charge_current": cs.charge_current,
+                "soc":            round(soc, 1) if soc is not None else None,
+                "stop_reason":    cs.stop_reason,
             }
 
         up_s   = int(time.time() - self._start_time)
@@ -3336,9 +3953,22 @@ def main():
             charger_cfg["cell_voltage_max"],
             charger_cfg["target_voltage"]))
 
-    # Setup data history
-    history     = DataHistory()
+    # Setup data history (with optional CSV persistence)
+    persist_file = None
+    if cfg.getboolean("history", "persist"):
+        persist_file = cfg.get("history", "file")
+    history = DataHistory(
+        persist_file=persist_file,
+        flush_interval=cfg.getfloat("history", "flush_interval"),
+        retention_days=cfg.getfloat("history", "retention_days"),
+    )
     bus.history = history
+    if persist_file:
+        print("[flatpack2] History persistence: {} (flush {:.0f}s, "
+              "retention {:.0f} days)".format(
+                  persist_file,
+                  cfg.getfloat("history", "flush_interval"),
+                  cfg.getfloat("history", "retention_days")))
 
     # Setup Web-GUI if enabled
     webgui = None
@@ -3375,6 +4005,7 @@ def main():
     finally:
         bus.stop()
         bus.disconnect()
+        history.close()   # flush pending CSV rows
         if terminal:
             terminal.close()
         log.info("flatpack2 stopped")

@@ -2,6 +2,120 @@
 
 All notable changes to flatpack2 are documented in this file.
 
+## [3.0.2] - 2026
+### Fixed
+- **PSU overload at the RAMP->CC transition** (diagnosed from a real
+  incident's CSV history). On entering CC the charger sent the final
+  `target_voltage` in a SINGLE step - e.g. a 54.4V -> 57.6V jump into a
+  400Ah battery (~45 mOhm path). The PSU's current limiter cannot follow
+  such a step instantaneously and overshoots: measured 42.6A transient on
+  a 41.7A/2000W unit (~2.3 kW), after which the PSU tripped its protection
+  and shut down. The setpoint now NEVER moves by more than
+  `ramp_step_voltage` at a time: after the CC transition the ramp thread
+  keeps stepping the setpoint toward `target_voltage`
+  (`_cc_setpoint_ramp`); the PSU stays in current limit and each small
+  step is absorbed without overshoot. The CC->CV condition is unaffected
+  (still `vout >= target - tolerance`, handled by `on_status`); if CV
+  triggers while the setpoint is within tolerance of target, the final
+  value is sent as a harmless <= tolerance step. This supersedes the
+  3.0.0 "RAMP->CC never reached target voltage" fix, which traded the
+  stall for the overload.
+- **`charge current <A>` in CC phase had the same jump bug** - it re-sent
+  `target_voltage` regardless of where the setpoint actually was. It now
+  uses the current setpoint (`ramp_voltage`) while the CC setpoint ramp is
+  still in progress.
+
+## [3.0.1] - 2026
+### Fixed
+- **Web-GUI showed no values at all ("--") and buttons were dead** - the
+  `chargeReset()` confirm dialog (added in 3.0.0) contained a `\n` escape
+  inside the dashboard template. Python interpreted it as a literal newline
+  inside a JavaScript string literal, producing a SyntaxError that prevented
+  the ENTIRE dashboard script from executing: no SSE connection, no event
+  listeners, no charts. Backend/API were unaffected (`/api/status` worked).
+  Fixed by escaping to `\\n`.
+- **CSV history load could desync the RAM ring buffers** - a truncated last
+  row in the history CSV (e.g. power loss during a buffered flush) was
+  partially appended: `ts`/`vout` made it into the deques before the parse
+  error, leaving the five series with mismatched lengths. All fields are now
+  validated before any append, and invalid rows are also dropped from the
+  retention rewrite, so the file self-heals on startup.
+
+### Changed
+- **Warnings and errors no longer interleave with the CLI prompt.** The PTY
+  terminal now has a persistent status bar on the top row (ANSI DECSTBM
+  scroll region; normal output scrolls below it). Async events - PSU
+  ALARM/WARNING alerts, CAN bus loss/reconnect, charger error stops - are
+  shown there (color-coded: red=error, yellow=warning, cyan=info, with a
+  timestamp) instead of being printed into the scrollback, which used to
+  corrupt the line being typed. In stdio mode the previous inline printing
+  is kept as a fallback. New `FlatpackBus.notify(msg, level)` is the single
+  entry point (status bar + log + Web-GUI log buffer).
+- **Alert notifications are edge-triggered** - the PSU repeats alert
+  responses every second (e.g. "Current Limit" for the whole CC phase);
+  the user is now notified only when the set of active warnings/alarms
+  changes. The status bar keeps the last message visible, and every
+  occurrence is still written to the log file.
+
+## [3.0.0] - 2026
+### Added
+- **Change charge current at runtime** – `charge current <A>` in the CLI and a
+  "Current A" input with a **Set I** button in the Web-GUI charger card. Takes
+  effect immediately: in RAMP/CC/CV the SET frame is re-sent with the current
+  voltage setpoint; in DETECT the new value is stored and applied once the
+  battery is detected. New value is range-checked against the PSU limit.
+- **Charger reset** – `charge reset` (CLI) and a **Reset** button (Web-GUI,
+  with confirmation dialog). Clears the Ah/Wh counters, restores the charge
+  current to the config default and restarts the cycle from the DETECT phase.
+- **CSV history persistence** – new `[history]` section. When `persist = true`,
+  samples are appended to a CSV file (`timestamp_ms,vout,iout,ah,wh`), buffered
+  and flushed every `flush_interval` seconds to spare SD/flash media. On startup
+  the last 12 h are loaded back into RAM so the graphs survive a restart, and
+  rows older than `retention_days` are trimmed (atomic rewrite via temp file).
+- **SOC estimate** – rough state-of-charge shown in `charge status`, the SSE
+  payload and as the Web-GUI progress bar. Anchored from the resting OCV at
+  battery detection (LiFePO4 per-cell OCV→SOC table, linear interpolation),
+  then tracked by coulomb counting (`charged Ah / capacity`); in CV it is
+  pulled toward 100 % as the current tapers. Always labelled "(estimate)".
+- **Live values in the header** – Vout·Iout are shown in the top bar at all
+  times; Ah·Wh are added when the charger is configured.
+- **Stop reason in the Web-GUI** – the charger card shows the last stop reason
+  (was already present in the CLI/SSE, now surfaced in the dashboard).
+- Config keys: `webgui.sse_interval`, `charger.disconnect_detect_time`,
+  and the whole `[history]` section. All optional with safe fallbacks.
+
+### Fixed
+- **Battery disconnect not detected in CC phase** – if the battery was
+  unplugged during CC the current collapsed to ~0 A but the charger stayed in
+  CC forever. It now watches for `iout <= min_current_detect` sustained for
+  `disconnect_detect_time` seconds and returns to DETECT to wait for the
+  battery to come back. Ah/Wh counters are preserved across the disconnect.
+- **Battery disconnect vs end-of-charge in CV phase** – a sudden current
+  collapse (e.g. 20 A → 0 A between two STATUS frames) is now treated as a
+  disconnect (→ DETECT), while a gradual taper through the tail value is a real
+  end-of-charge (→ done). Previously any current at/below tail ended the charge.
+- **RAMP→CC never reached target voltage** – on the RAMP→CC transition the
+  setpoint stayed at the last ramp voltage, so the PSU sat in current limit
+  below target and the CC→CV condition (`vout >= target − tol`) could never be
+  met. The final target voltage is now sent on entering CC.
+- **ALARM handling now covers all phases** – PSU ALARM is handled centrally in
+  the RX status dispatch (edge-triggered), so it also triggers in DETECT/RAMP,
+  not only in CC/CV. On ALARM the PSU is put into standby / the charge is
+  aborted into the ERROR state, which requires a manual Start/Reset to clear
+  (no silent auto-restart).
+
+### Changed
+- **Standby values moved inline** next to the Set/Standby buttons in the
+  Web-GUI (previously on a separate line below).
+- **Ah/Wh are preserved on battery disconnect** (RAMP and CC/CV) instead of
+  being reset; they are cleared only by `charge reset`.
+- **Default SSE update interval reduced from 10 s to 3 s** (`sse_interval`),
+  for a more responsive dashboard while watching the ramp/current. History
+  sampling stays tied to the STATUS frames as before.
+- Internal: charger detect/ramp threads now carry a generation counter
+  (`run_id`) so a reset/restart cleanly supersedes any in-flight thread and two
+  loops can never drive the PSU at the same time.
+
 ## [2.9.5] - 2026
 ### Added
 - **Bundled data files in the wheel**: `flatpack2.conf`, `flatpack2_charger.conf`,
