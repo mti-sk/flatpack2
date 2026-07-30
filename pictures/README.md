@@ -1,8 +1,8 @@
-# Flatpack2
+# Flatpack2 - project gallery
 
-Project gallery
+Picture of software and hardware
 
-## Galerie
+## Gallery
 
 <!--
 
