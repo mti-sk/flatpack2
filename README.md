@@ -3,7 +3,7 @@
 **CLI + Web-GUI controller for Eltek Flatpack2 48V/2000W HE rectifiers via CAN bus**
 
 > Tested on real hardware with Waveshare USB-CAN-A adapter (STM32, CH341).
-
+ [`< Project gallery >`](/pictures/README.md)
 ---
 
 ## ⚠️ Disclaimer
